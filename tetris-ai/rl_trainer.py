@@ -201,6 +201,7 @@ class RLTrainer:
         self.target_policy = self.policy.clone()
         self.best_policy = self.policy.clone()
         self.checkpoint_path = self.runtime / "tetris_policy.json"
+        self.best_checkpoint_path = self.runtime / "tetris_policy.best.json"
         self.metrics_path = self.runtime / "training_metrics.jsonl"
         self.replay_path = self.runtime / "latest_replay.json"
         self.eval_path = self.runtime / "latest_evaluation.json"
@@ -308,6 +309,8 @@ class RLTrainer:
                 self.best_lines = max(self.best_lines, final["lines"])
                 self.best_policy = self.policy.clone()
                 final["new_best"] = True
+                if persist:
+                    self._save_best_checkpoint()
             elif previous_best_score and final["score"] < previous_best_score * 0.55:
                 self.policy.soft_update_from(self.best_policy, self.elite_anchor)
                 self.target_policy.soft_update_from(self.best_policy, self.elite_anchor * 0.5)
@@ -354,18 +357,18 @@ class RLTrainer:
         self.replay_path.write_text(json.dumps({"latest": self.latest_info, "frames": latest_replay}, ensure_ascii=False, indent=2), encoding="utf-8")
         return evaluation
 
-    def train_guarded_batch(self, episodes: int, *, eval_episodes: int = 4, accept_ratio: float = 0.98) -> dict:
+    def train_guarded_batch(self, episodes: int, *, eval_episodes: int = 4, accept_min_delta: float = 0.0) -> dict:
         with self.training_lock:
             return self._train_guarded_batch(
                 episodes,
                 eval_episodes=eval_episodes,
-                accept_ratio=accept_ratio,
+                accept_min_delta=accept_min_delta,
             )
 
-    def _train_guarded_batch(self, episodes: int, *, eval_episodes: int = 4, accept_ratio: float = 0.98) -> dict:
+    def _train_guarded_batch(self, episodes: int, *, eval_episodes: int = 4, accept_min_delta: float = 0.0) -> dict:
         episodes = max(1, min(500, int(episodes)))
         eval_episodes = max(2, min(24, int(eval_episodes)))
-        accept_ratio = max(0.7, min(1.1, float(accept_ratio)))
+        accept_min_delta = max(-100000.0, min(100000.0, float(accept_min_delta)))
         with self.lock:
             original = {
                 "policy": self.policy.clone(),
@@ -411,12 +414,12 @@ class RLTrainer:
         )
         baseline_objective = self._guard_objective(baseline)
         candidate_objective = self._guard_objective(candidate)
-        accepted = candidate_objective >= baseline_objective * accept_ratio
+        accepted = candidate_objective >= baseline_objective + accept_min_delta
         guard = {
             "accepted": accepted,
             "episodes": episodes,
             "eval_episodes": eval_episodes,
-            "accept_ratio": accept_ratio,
+            "accept_min_delta": accept_min_delta,
             "baseline_score": baseline["avg_score"],
             "candidate_score": candidate["avg_score"],
             "baseline_tetrises": baseline["avg_tetrises"],
@@ -433,6 +436,7 @@ class RLTrainer:
                 if latest is None:
                     latest = candidate_latest
                 latest["guard"] = guard
+                self._save_best_checkpoint(objective=candidate_objective)
                 self._persist(latest, candidate_replay)
             else:
                 self.policy = original["policy"]
@@ -616,6 +620,7 @@ class RLTrainer:
                 "history": self.history[-120:],
                 "weights": self.weight_summary(),
                 "checkpoint": str(self.checkpoint_path),
+                "best_checkpoint": str(self.best_checkpoint_path),
                 "replay_frames": len(self.latest_replay),
             }
 
@@ -663,7 +668,7 @@ class RLTrainer:
             with self.lock:
                 batch_episodes = self.background_guard_episodes
                 eval_episodes = self.background_eval_episodes
-            self.train_guarded_batch(batch_episodes, eval_episodes=eval_episodes, accept_ratio=1.0)
+            self.train_guarded_batch(batch_episodes, eval_episodes=eval_episodes, accept_min_delta=0.0)
             time.sleep(0.01)
 
     def _persist(self, metrics: dict, replay: list[dict]) -> None:
@@ -698,6 +703,36 @@ class RLTrainer:
             "best_policy": self.best_policy.to_json(),
         }
         self.checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        if self.best_score > 0:
+            self._save_best_checkpoint()
+
+    def _save_best_checkpoint(self, *, objective: float | None = None) -> None:
+        payload = {
+            "episode": self.episode,
+            "objective": objective,
+            "best_score": self.best_score,
+            "best_lines": self.best_lines,
+            "config": {
+                "learning_rate": self.learning_rate,
+                "gamma": self.gamma,
+                "epsilon": self.epsilon,
+                "temperature": self.temperature,
+                "target_tau": self.target_tau,
+                "elite_anchor": self.elite_anchor,
+                "lookahead_weight": self.lookahead_weight,
+                "lookahead_candidates": self.lookahead_candidates,
+                "lookahead_include_hold": self.lookahead_include_hold,
+                "train_max_pieces": self.train_max_pieces,
+                "eval_max_pieces": self.eval_max_pieces,
+                "guard_max_pieces": self.guard_max_pieces,
+                "background_guard_episodes": self.background_guard_episodes,
+                "background_eval_episodes": self.background_eval_episodes,
+            },
+            "policy": self.best_policy.to_json(),
+            "target_policy": self.best_policy.to_json(),
+            "best_policy": self.best_policy.to_json(),
+        }
+        self.best_checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _load_checkpoint(self) -> None:
         if not self.checkpoint_path.exists():

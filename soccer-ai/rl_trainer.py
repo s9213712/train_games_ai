@@ -115,6 +115,7 @@ class RLTrainer:
         self.runtime = self.root / "runtime"
         self.runtime.mkdir(parents=True, exist_ok=True)
         self.checkpoint_path = self.runtime / "soccer_policy.json"
+        self.best_checkpoint_path = self.runtime / "soccer_policy.best.json"
         self.replay_path = self.runtime / "latest_replay.json"
         self.metrics_path = self.runtime / "training_metrics.jsonl"
         self.eval_path = self.runtime / "latest_evaluation.json"
@@ -138,6 +139,8 @@ class RLTrainer:
         self.guard_batch_episodes = 20
         self.guard_eval_episodes = 32
         self.guard_accept_margin = 0.0
+        self.guard_opponent = "mixed"
+        self.best_guard_objective = -math.inf
         self.coach_enabled = True
         self.coach_rate = 0.001
         self.elo = 1000.0
@@ -276,6 +279,8 @@ class RLTrainer:
             self.guard_batch_episodes = max(1, min(100, int(payload.get("guard_batch_episodes", self.guard_batch_episodes))))
             self.guard_eval_episodes = max(4, min(120, int(payload.get("guard_eval_episodes", self.guard_eval_episodes))))
             self.guard_accept_margin = max(-10.0, min(25.0, float(payload.get("guard_accept_margin", self.guard_accept_margin))))
+            guard_opponent = str(payload.get("guard_opponent", self.guard_opponent) or self.guard_opponent)
+            self.guard_opponent = guard_opponent if guard_opponent in {"mixed", "scripted", "current_red", "league"} else "mixed"
             self.coach_enabled = bool(payload.get("coach_enabled", self.coach_enabled))
             self.coach_rate = max(0.0, min(0.05, float(payload.get("coach_rate", self.coach_rate))))
             self.last_event = "settings updated"
@@ -300,6 +305,7 @@ class RLTrainer:
                     "guard_batch_episodes": self.guard_batch_episodes,
                     "guard_eval_episodes": self.guard_eval_episodes,
                     "guard_accept_margin": self.guard_accept_margin,
+                    "guard_opponent": self.guard_opponent,
                     "coach_enabled": self.coach_enabled,
                     "coach_rate": self.coach_rate,
                 },
@@ -327,6 +333,7 @@ class RLTrainer:
                 "history": self.history[-80:],
                 "evaluation": dict(self.last_eval),
                 "checkpoint": str(self.checkpoint_path),
+                "best_checkpoint": str(self.best_checkpoint_path),
                 "replay_frames": len(self.latest_replay),
             }
 
@@ -346,12 +353,13 @@ class RLTrainer:
             original = self._capture_state_locked()
             start_episode = self.episode
             seeds = [830_000 + start_episode * 37 + index for index in range(eval_episodes)]
+            guard_opponent = self.guard_opponent
         baseline = self._evaluate_policy(
             original["policy"],
             original["red_policy"],
             original["league_pool"],
             seeds,
-            opponent="scripted",
+            opponent=guard_opponent,
         )
         latest = None
         for _ in range(episodes):
@@ -362,7 +370,7 @@ class RLTrainer:
             candidate_pool = self._clone_league_pool_locked()
             candidate_replay = list(self.latest_replay)
             candidate_latest = dict(self.latest_info)
-        candidate = self._evaluate_policy(candidate_policy, candidate_red, candidate_pool, seeds, opponent="scripted")
+        candidate = self._evaluate_policy(candidate_policy, candidate_red, candidate_pool, seeds, opponent=guard_opponent)
         baseline_objective = self._guard_objective(baseline)
         candidate_objective = self._guard_objective(candidate)
         accepted = candidate_objective >= baseline_objective + accept_margin
@@ -370,6 +378,7 @@ class RLTrainer:
             "accepted": accepted,
             "episodes": episodes,
             "eval_episodes": eval_episodes,
+            "opponent": guard_opponent,
             "accept_margin": round(accept_margin, 3),
             "baseline_objective": round(baseline_objective, 3),
             "candidate_objective": round(candidate_objective, 3),
@@ -388,6 +397,7 @@ class RLTrainer:
                     latest = candidate_latest
                 latest["guard"] = guard
                 self.last_event = f"guard accepted {episodes}: {baseline_objective:.2f} -> {candidate_objective:.2f}"
+                self._save_best_checkpoint(candidate_objective)
                 self._persist(latest, candidate_replay)
             else:
                 self._restore_state_locked(original)
@@ -588,6 +598,8 @@ class RLTrainer:
             "guard_batch_episodes": self.guard_batch_episodes,
             "guard_eval_episodes": self.guard_eval_episodes,
             "guard_accept_margin": self.guard_accept_margin,
+            "guard_opponent": self.guard_opponent,
+            "best_guard_objective": None if not math.isfinite(self.best_guard_objective) else self.best_guard_objective,
             "coach_enabled": self.coach_enabled,
             "coach_rate": self.coach_rate,
             "policy": self.policy.to_json(),
@@ -608,6 +620,36 @@ class RLTrainer:
         }
         self.checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    def _save_best_checkpoint(self, objective: float) -> None:
+        if objective < self.best_guard_objective:
+            return
+        self.best_guard_objective = float(objective)
+        payload = {
+            "episode": self.episode,
+            "objective": self.best_guard_objective,
+            "baseline": self.baseline,
+            "elo": self.elo,
+            "scripted_elo": self.scripted_elo,
+            "league_enabled": self.league_enabled,
+            "guard_opponent": self.guard_opponent,
+            "policy": self.policy.to_json(),
+            "red_policy": self.red_policy.to_json(),
+            "league_pool": [
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "elo": row["elo"],
+                    "games": row.get("games", 0),
+                    "wins": row.get("wins", 0),
+                    "losses": row.get("losses", 0),
+                    "draws": row.get("draws", 0),
+                    "policy": row["policy"].to_json(),
+                }
+                for row in self.league_pool
+            ],
+        }
+        self.best_checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
     def _load_checkpoint(self) -> None:
         if not self.checkpoint_path.exists():
             return
@@ -622,6 +664,10 @@ class RLTrainer:
             self.guard_batch_episodes = int(payload.get("guard_batch_episodes", self.guard_batch_episodes))
             self.guard_eval_episodes = int(payload.get("guard_eval_episodes", self.guard_eval_episodes))
             self.guard_accept_margin = float(payload.get("guard_accept_margin", self.guard_accept_margin))
+            self.guard_opponent = str(payload.get("guard_opponent", self.guard_opponent) or self.guard_opponent)
+            best_objective = payload.get("best_guard_objective")
+            if best_objective is not None:
+                self.best_guard_objective = float(best_objective)
             self.coach_enabled = bool(payload.get("coach_enabled", self.coach_enabled))
             self.coach_rate = float(payload.get("coach_rate", self.coach_rate))
             self.policy.load_json(dict(payload.get("policy") or {}))
@@ -736,11 +782,14 @@ class RLTrainer:
         if opponent == "league" and pool:
             row = pool[index % len(pool)]
             return {"kind": "league", "id": row["id"], "name": row["name"], "elo": row["elo"], "policy": row["policy"]}
-        if pool and index % 3 == 0:
+        slot = index % 4
+        if slot < 2:
+            return {"kind": "scripted", "name": "scripted red", "elo": 950.0}
+        if slot == 2:
+            return {"kind": "current_red", "name": "current red", "elo": 1000.0}
+        if pool:
             row = pool[index % len(pool)]
             return {"kind": "league", "id": row["id"], "name": row["name"], "elo": row["elo"], "policy": row["policy"]}
-        if index % 3 == 1:
-            return {"kind": "current_red", "name": "current red", "elo": 1000.0}
         return {"kind": "scripted", "name": "scripted red", "elo": 950.0}
 
     @staticmethod

@@ -32,6 +32,8 @@ WEB_DIR = ROOT_DIR / "web"
 MAIN_DIR = ROOT_DIR / "main"
 ORIGINAL_MODEL_DIR = MAIN_DIR / "original_models"
 FULLBOARD_CNN_MODEL = MAIN_DIR / "trained_models_cnn_oracle_bc" / "ppo_snake_bc_final_12x12.zip"
+RUNTIME_DIR = ROOT_DIR / "runtime"
+BEST_MODEL_PATH = RUNTIME_DIR / "snake_policy.best.zip"
 MAX_MODEL_UPLOAD_BYTES = int(os.environ.get("SNAKE_MAX_MODEL_UPLOAD_BYTES", str(128 * 1024 * 1024)))
 MODEL_UPLOAD_ENABLED = os.environ.get("SNAKE_ENABLE_MODEL_UPLOAD", "").strip().lower() in {
     "1",
@@ -65,7 +67,7 @@ DEFAULT_CONFIG = {
     "guard_enabled": True,
     "guard_eval_episodes": 8,
     "guard_eval_steps": 600,
-    "guard_accept_ratio": 1.0,
+    "guard_min_delta": 0.0,
     "food_time_penalty": 0.0,
     "food_step_limit_multiplier": 4.0,
     "food_reward_bonus": 0.0,
@@ -115,6 +117,7 @@ class TrainingDashboard:
         self.best_score_steps = 0
         self.best_score_trained_steps = 0
         self.best_score_iteration = 0
+        self.best_guard_objective = float("-inf")
         self.last_guard = {}
         self.actual_device = None
         self.last_error = None
@@ -153,6 +156,8 @@ class TrainingDashboard:
                     "steps": self.best_score_steps,
                     "trained_steps": self.best_score_trained_steps,
                     "iteration": self.best_score_iteration,
+                    "guard_objective": None if self.best_guard_objective == float("-inf") else self.best_guard_objective,
+                    "model_path": str(BEST_MODEL_PATH),
                 },
                 "architecture": {
                     "cnn": self._cnn_architecture_summary(),
@@ -199,6 +204,7 @@ class TrainingDashboard:
             self.best_score_steps = 0
             self.best_score_trained_steps = 0
             self.best_score_iteration = 0
+            self.best_guard_objective = float("-inf")
             self.last_guard = {}
             self.actual_device = None
             self.last_error = None
@@ -406,7 +412,7 @@ class TrainingDashboard:
         self.config["preview_steps"] = max(10, self.config["preview_steps"])
         self.config["guard_eval_episodes"] = max(2, min(64, self.config["guard_eval_episodes"]))
         self.config["guard_eval_steps"] = max(50, min(5000, self.config["guard_eval_steps"]))
-        self.config["guard_accept_ratio"] = max(0.5, min(1.5, self.config["guard_accept_ratio"]))
+        self.config["guard_min_delta"] = max(-1000.0, min(1000.0, self.config["guard_min_delta"]))
         self.config["batch_size"] = max(8, self.config["batch_size"])
         self.config["n_steps"] = max(8, self.config["n_steps"])
         self.config["num_envs"] = max(1, self.config["num_envs"])
@@ -751,7 +757,7 @@ class TrainingDashboard:
                         guard_seed = int(self.config["seed"]) + self.iteration * 10_007 + 50_000
                         guard_episodes = int(self.config["guard_eval_episodes"])
                         guard_steps = int(self.config["guard_eval_steps"])
-                        accept_ratio = float(self.config["guard_accept_ratio"])
+                        min_delta = float(self.config["guard_min_delta"])
                         with tempfile.TemporaryDirectory() as tmpdir:
                             checkpoint = Path(tmpdir) / "model_before.zip"
                             baseline = {}
@@ -777,14 +783,18 @@ class TrainingDashboard:
                                     episodes=guard_episodes,
                                     max_steps=guard_steps,
                                 )
-                                accepted = candidate["objective"] >= baseline["objective"] * accept_ratio
+                                accepted = candidate["objective"] >= baseline["objective"] + min_delta
                                 if not accepted:
                                     self.model = self._load_model(checkpoint, self.train_env, self.model.device)
+                                elif candidate["objective"] >= self.best_guard_objective:
+                                    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                                    self.model.save(BEST_MODEL_PATH)
+                                    self.best_guard_objective = candidate["objective"]
                                 guard = {
                                     "accepted": accepted,
                                     "episodes": guard_episodes,
                                     "max_steps": guard_steps,
-                                    "accept_ratio": accept_ratio,
+                                    "min_delta": min_delta,
                                     "baseline": baseline,
                                     "candidate": candidate,
                                 }

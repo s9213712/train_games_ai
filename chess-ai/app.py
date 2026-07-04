@@ -35,6 +35,14 @@ DEFAULT_WEIGHTS = {
 }
 FEATURE_KEYS = tuple(DEFAULT_WEIGHTS.keys())
 TEACHER_BUFFER_LIMIT = 800
+GUARD_FENS = (
+    "rnbqkbnr/pppp1ppp/4p3/8/3P4/5N2/PPP1PPPP/RNBQKB1R b KQkq - 1 2",
+    "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/5N2/PP2PPPP/RNBQKB1R b KQkq c3 0 3",
+    "rnb2kn1/p1p2p2/3bp1p1/8/5PP1/2P5/P4K2/1q6 b - - 0 20",
+    "rn1q4/ppp1k3/r3p2b/2P1Kp2/8/5P2/1P4P1/8 b - - 2 24",
+    "2krr3/p1p4p/np6/5P2/5b2/1PP2q1P/P7/R5KR b - - 1 19",
+    "2krr3/p1p4p/n7/1p3P2/5b2/1PP2q1P/P7/1R4KR b - - 1 20",
+)
 
 
 def resolve_stockfish_path() -> str:
@@ -426,6 +434,8 @@ class Trainer:
         self.mutation = 0.12
         self.learning_rate = 0.025
         self.teacher_learning_rate = 0.05
+        self.guard_enabled = True
+        self.guard_min_gap_delta = 0.0
         self.discount = 0.94
         self.reset()
 
@@ -452,6 +462,7 @@ class Trainer:
             self.black_wins = 0
             self.draws = 0
             self.history = []
+            self.last_guard = {}
             self.moves = []
             self.teacher = {"available": False, "source": "none", "best_move": "", "eval_cp": 0, "lines": []}
             self.last_event = "reset"
@@ -561,6 +572,30 @@ class Trainer:
         self.teacher_updates += 1
         self.policy_updates += 1
 
+    def evaluate_teacher_gap(self, weights: dict[str, float] | None = None) -> dict:
+        eval_weights = weights or self.weights
+        gaps = []
+        matches = 0
+        for fen in GUARD_FENS:
+            board = chess.Board(fen)
+            teacher = fallback_teacher(board, depth=1)
+            best = str(teacher.get("best_move") or "")
+            rows = {str(row.get("move") or ""): float(row.get("score_cp") or 0.0) for row in teacher.get("lines", [])}
+            moves = list(board.legal_moves)
+            if not moves:
+                continue
+            chosen = max(moves, key=lambda move: (score_move(board, move, eval_weights), move.uci()))
+            matches += int(chosen.uci() == best)
+            best_score = rows.get(best, 0.0)
+            chosen_score = rows.get(chosen.uci(), evaluate_board(board, DEFAULT_WEIGHTS))
+            gaps.append(abs(best_score - chosen_score))
+        count = max(1, len(gaps))
+        return {
+            "positions": count,
+            "avg_gap": round(sum(gaps) / count, 4),
+            "match_rate": round(matches / count, 4),
+        }
+
     def apply_episode_result_update(self, final_signal: float) -> None:
         if not self.episode_trace or abs(final_signal) < 0.0001:
             return
@@ -617,6 +652,41 @@ class Trainer:
     def step_once(self) -> None:
         with self.step_lock:
             self._step_once()
+
+    def step_guarded(self, count: int) -> dict:
+        count = max(1, min(500, int(count)))
+        if not self.guard_enabled:
+            for _ in range(count):
+                self.step_once()
+            return {"enabled": False, "steps": count}
+        with self.step_lock:
+            with self.lock:
+                before_weights = dict(self.weights)
+            baseline = self.evaluate_teacher_gap(before_weights)
+            for _ in range(count):
+                self._step_once()
+            with self.lock:
+                candidate_weights = dict(self.weights)
+            candidate = self.evaluate_teacher_gap(candidate_weights)
+            accepted = candidate["avg_gap"] < baseline["avg_gap"] - self.guard_min_gap_delta
+            guard = {
+                "enabled": True,
+                "accepted": accepted,
+                "steps": count,
+                "min_gap_delta": self.guard_min_gap_delta,
+                "baseline": baseline,
+                "candidate": candidate,
+            }
+            with self.lock:
+                if not accepted:
+                    self.weights = before_weights
+                self.last_guard = guard
+                self.last_event = (
+                    f"guard accepted {baseline['avg_gap']:.1f}->{candidate['avg_gap']:.1f}"
+                    if accepted
+                    else f"guard rejected {candidate['avg_gap']:.1f}>{baseline['avg_gap']:.1f}"
+                )
+            return guard
 
     def _step_once(self) -> None:
         with self.lock:
@@ -685,8 +755,7 @@ class Trainer:
                 time.sleep(0.08)
                 continue
             try:
-                for _ in range(max(1, chunk)):
-                    self.step_once()
+                self.step_guarded(max(1, chunk))
             except Exception as exc:
                 with self.lock:
                     self.last_error = str(exc)
@@ -717,6 +786,8 @@ class Trainer:
             self.mutation = max(0.0, min(1.0, float(updates.get("mutation", self.mutation))))
             self.learning_rate = max(0.0, min(0.5, float(updates.get("learning_rate", self.learning_rate))))
             self.teacher_learning_rate = max(0.0, min(0.5, float(updates.get("teacher_learning_rate", self.teacher_learning_rate))))
+            self.guard_enabled = bool(updates.get("guard_enabled", self.guard_enabled))
+            self.guard_min_gap_delta = max(-1000.0, min(1000.0, float(updates.get("guard_min_gap_delta", self.guard_min_gap_delta))))
             weights = updates.get("weights")
             if isinstance(weights, dict):
                 for key in self.weights:
@@ -765,6 +836,7 @@ class Trainer:
                     "win_rate": round(win_rate, 4),
                 },
                 "weights": dict(self.weights),
+                "guard": dict(self.last_guard),
                 "history": self.history[-80:],
                 "moves": self.moves[-20:],
                 "teacher": dict(self.teacher),
@@ -782,6 +854,8 @@ class Trainer:
                     "mutation": self.mutation,
                     "learning_rate": self.learning_rate,
                     "teacher_learning_rate": self.teacher_learning_rate,
+                    "guard_enabled": self.guard_enabled,
+                    "guard_min_gap_delta": self.guard_min_gap_delta,
                 },
                 "last_event": self.last_event,
                 "last_error": self.last_error,
@@ -836,8 +910,7 @@ def api_step():
         count = int((request.get_json(silent=True) or {}).get("count", 1))
     except (TypeError, ValueError) as exc:
         return json_error(exc, 400)
-    for _ in range(max(1, min(500, count))):
-        trainer.step_once()
+    trainer.step_guarded(count)
     return jsonify(trainer.snapshot())
 
 

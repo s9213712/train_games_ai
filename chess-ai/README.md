@@ -2,12 +2,15 @@
 
 Interactive chess training dashboard using `python-chess` and an optional Stockfish UCI engine as opponent and mentor.
 
-The student does not train by fitting Stockfish's move output. Stockfish is used
-as a live opponent, line viewer, and diagnostic benchmark. The student policy is
-updated from reinforcement signals: material/position change after its own moves,
-the opponent reply, and the final game result. The dashboard still reports
-Stockfish agreement as a diagnostic, but that agreement is not used as the
-training target.
+The student uses both reinforcement signals and teacher guidance. Material and
+position changes, opponent replies, and final game results update the heuristic
+weights. When the student chooses a different move from the teacher, a small
+ranking update also moves the weights toward the teacher move's feature vector
+and away from the chosen move. The dashboard reports teacher agreement and
+teacher-update counts so the teacher-guided part of training is explicit.
+Training chunks are guarded with a fixed FEN probe against the deterministic
+fallback teacher: if the candidate weights do not reduce the average teacher
+score gap, the weights are rolled back.
 
 ## Run
 
