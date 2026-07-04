@@ -62,6 +62,10 @@ DEFAULT_CONFIG = {
     "complete_episode_preview": True,
     "deterministic_preview": True,
     "training_enabled": False,
+    "guard_enabled": True,
+    "guard_eval_episodes": 8,
+    "guard_eval_steps": 600,
+    "guard_accept_ratio": 1.0,
     "food_time_penalty": 0.0,
     "food_step_limit_multiplier": 4.0,
     "food_reward_bonus": 0.0,
@@ -111,6 +115,7 @@ class TrainingDashboard:
         self.best_score_steps = 0
         self.best_score_trained_steps = 0
         self.best_score_iteration = 0
+        self.last_guard = {}
         self.actual_device = None
         self.last_error = None
         self.last_event = "idle"
@@ -142,6 +147,7 @@ class TrainingDashboard:
                 "frame_version": self.frame_version,
                 "frames": self.frames,
                 "history": self.history[-80:],
+                "guard": dict(self.last_guard),
                 "best": {
                     "score": self.best_score,
                     "steps": self.best_score_steps,
@@ -193,6 +199,7 @@ class TrainingDashboard:
             self.best_score_steps = 0
             self.best_score_trained_steps = 0
             self.best_score_iteration = 0
+            self.last_guard = {}
             self.actual_device = None
             self.last_error = None
             self.last_event = "reset"
@@ -380,9 +387,9 @@ class TrainingDashboard:
                 self.config[key] = str(value)
             elif key in {"cnn_channels", "cnn_kernel_sizes", "cnn_strides"}:
                 self.config[key] = self._normalize_int_list(value)
-            elif key in {"deterministic_preview", "complete_episode_preview", "cnn_channel_first", "training_enabled"}:
+            elif key in {"deterministic_preview", "complete_episode_preview", "cnn_channel_first", "training_enabled", "guard_enabled"}:
                 self.config[key] = bool(value)
-            elif key in {"board_size", "seed", "n_steps", "batch_size", "num_envs", "n_epochs", "chunk_timesteps", "preview_steps", "loop_window", "oscillation_window", "cnn_features_dim"}:
+            elif key in {"board_size", "seed", "n_steps", "batch_size", "num_envs", "n_epochs", "chunk_timesteps", "preview_steps", "loop_window", "oscillation_window", "cnn_features_dim", "guard_eval_episodes", "guard_eval_steps"}:
                 self.config[key] = max(1, int(value))
             else:
                 self.config[key] = float(value)
@@ -397,6 +404,9 @@ class TrainingDashboard:
         self.config["board_size"] = max(4, self.config["board_size"])
         self.config["chunk_timesteps"] = max(16, self.config["chunk_timesteps"])
         self.config["preview_steps"] = max(10, self.config["preview_steps"])
+        self.config["guard_eval_episodes"] = max(2, min(64, self.config["guard_eval_episodes"]))
+        self.config["guard_eval_steps"] = max(50, min(5000, self.config["guard_eval_steps"]))
+        self.config["guard_accept_ratio"] = max(0.5, min(1.5, self.config["guard_accept_ratio"]))
         self.config["batch_size"] = max(8, self.config["batch_size"])
         self.config["n_steps"] = max(8, self.config["n_steps"])
         self.config["num_envs"] = max(1, self.config["num_envs"])
@@ -571,6 +581,72 @@ class TrainingDashboard:
 
         return DummyVecEnv([lambda rank=rank: _init(rank) for rank in range(self.config["num_envs"])])
 
+    def _make_eval_env(self, seed):
+        env_cls = self._env_class()
+        env_kwargs = {
+            "seed": seed,
+            "board_size": self.config["board_size"],
+            "silent_mode": True,
+            "limit_step": True,
+            "food_time_penalty": self.config["food_time_penalty"],
+            "food_step_limit_multiplier": self.config["food_step_limit_multiplier"],
+            "food_reward_bonus": self.config["food_reward_bonus"],
+            "distance_reward_scale": self.config["distance_reward_scale"],
+            "loop_penalty": self.config["loop_penalty"],
+            "loop_window": self.config["loop_window"],
+            "oscillation_penalty": self.config["oscillation_penalty"],
+            "oscillation_window": self.config["oscillation_window"],
+        }
+        if env_cls is SnakeCnnEnv:
+            env_kwargs["channel_first"] = self.config["cnn_channel_first"]
+        return env_cls(**env_kwargs)
+
+    def _guard_objective(self, metrics):
+        return (
+            float(metrics.get("avg_score", 0.0))
+            + float(metrics.get("avg_food", 0.0)) * 0.5
+            + float(metrics.get("avg_reward", 0.0)) * 0.05
+        )
+
+    def _evaluate_model_score(self, model, *, seed_base, episodes, max_steps):
+        scores = []
+        foods = []
+        rewards = []
+        for index in range(int(episodes)):
+            seed = seed_base + index
+            env = self._make_eval_env(seed)
+            try:
+                obs, _info = env.reset(seed=seed)
+                done = False
+                total_reward = 0.0
+                food_count = 0
+                steps = 0
+                while not done and steps < max_steps:
+                    action, _state = model.predict(
+                        obs,
+                        deterministic=True,
+                        action_masks=env.get_action_mask(),
+                    )
+                    obs, reward, terminated, truncated, info = env.step(int(action))
+                    done = bool(terminated or truncated)
+                    total_reward += float(reward)
+                    food_count += int(bool(info.get("food_obtained")))
+                    steps += 1
+                scores.append(len(env.game.snake) - env.init_snake_size)
+                foods.append(food_count)
+                rewards.append(total_reward)
+            finally:
+                env.close()
+        count = max(1, len(scores))
+        metrics = {
+            "episodes": count,
+            "avg_score": round(sum(scores) / count, 4),
+            "avg_food": round(sum(foods) / count, 4),
+            "avg_reward": round(sum(rewards) / count, 5),
+        }
+        metrics["objective"] = round(self._guard_objective(metrics), 5)
+        return metrics
+
     def _ensure_model(self):
         if self.model is not None:
             return
@@ -668,19 +744,58 @@ class TrainingDashboard:
 
                 start = time.time()
                 start_steps = int(self.model.num_timesteps) if self.model is not None else self.trained_steps
+                guard = {}
                 if training_enabled:
                     with self.model_io_lock:
-                        self.model.learn(
-                            total_timesteps=chunk,
-                            reset_num_timesteps=False,
-                            progress_bar=False,
-                        )
+                        guard_enabled = bool(self.config["guard_enabled"])
+                        guard_seed = int(self.config["seed"]) + self.iteration * 10_007 + 50_000
+                        guard_episodes = int(self.config["guard_eval_episodes"])
+                        guard_steps = int(self.config["guard_eval_steps"])
+                        accept_ratio = float(self.config["guard_accept_ratio"])
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            checkpoint = Path(tmpdir) / "model_before.zip"
+                            baseline = {}
+                            if guard_enabled:
+                                self.model.save(checkpoint)
+                                baseline = self._evaluate_model_score(
+                                    self.model,
+                                    seed_base=guard_seed,
+                                    episodes=guard_episodes,
+                                    max_steps=guard_steps,
+                                )
+                            self.model.learn(
+                                total_timesteps=chunk,
+                                reset_num_timesteps=False,
+                                progress_bar=False,
+                            )
+                            candidate = {}
+                            accepted = True
+                            if guard_enabled:
+                                candidate = self._evaluate_model_score(
+                                    self.model,
+                                    seed_base=guard_seed,
+                                    episodes=guard_episodes,
+                                    max_steps=guard_steps,
+                                )
+                                accepted = candidate["objective"] >= baseline["objective"] * accept_ratio
+                                if not accepted:
+                                    self.model = self._load_model(checkpoint, self.train_env, self.model.device)
+                                guard = {
+                                    "accepted": accepted,
+                                    "episodes": guard_episodes,
+                                    "max_steps": guard_steps,
+                                    "accept_ratio": accept_ratio,
+                                    "baseline": baseline,
+                                    "candidate": candidate,
+                                }
                 elapsed = max(0.001, time.time() - start)
                 end_steps = int(self.model.num_timesteps) if self.model is not None else start_steps
                 trained_delta = max(0, end_steps - start_steps)
 
                 with self.lock:
                     self.trained_steps += trained_delta
+                    if guard:
+                        self.last_guard = guard
                     self.iteration += 1
                     preview_steps = int(self.config["preview_steps"])
                     deterministic = bool(self.config["deterministic_preview"])
@@ -708,7 +823,10 @@ class TrainingDashboard:
                     self._update_best(summary)
                     self.last_error = None
                     if training_enabled:
-                        self.last_event = f"trained to {self.trained_steps} steps"
+                        if guard and not guard.get("accepted", True):
+                            self.last_event = f"guard rejected candidate at {self.trained_steps} steps"
+                        else:
+                            self.last_event = f"trained to {self.trained_steps} steps"
                     else:
                         self.running = False
                         self.last_event = "previewed without training"
@@ -722,21 +840,23 @@ class TrainingDashboard:
     def _preview(self, max_steps, deterministic, complete_episode, strategy):
         env_cls = self._env_class()
         seed = self.config["seed"] + self.iteration * 1009
-        env = env_cls(
-            seed=seed,
-            board_size=self.config["board_size"],
-            silent_mode=True,
-            limit_step=complete_episode,
-            food_time_penalty=self.config["food_time_penalty"],
-            food_step_limit_multiplier=self.config["food_step_limit_multiplier"],
-            food_reward_bonus=self.config["food_reward_bonus"],
-            distance_reward_scale=self.config["distance_reward_scale"],
-            loop_penalty=self.config["loop_penalty"],
-            loop_window=self.config["loop_window"],
-            oscillation_penalty=self.config["oscillation_penalty"],
-            oscillation_window=self.config["oscillation_window"],
-            channel_first=self.config["cnn_channel_first"] if env_cls is SnakeCnnEnv else False,
-        )
+        env_kwargs = {
+            "seed": seed,
+            "board_size": self.config["board_size"],
+            "silent_mode": True,
+            "limit_step": complete_episode,
+            "food_time_penalty": self.config["food_time_penalty"],
+            "food_step_limit_multiplier": self.config["food_step_limit_multiplier"],
+            "food_reward_bonus": self.config["food_reward_bonus"],
+            "distance_reward_scale": self.config["distance_reward_scale"],
+            "loop_penalty": self.config["loop_penalty"],
+            "loop_window": self.config["loop_window"],
+            "oscillation_penalty": self.config["oscillation_penalty"],
+            "oscillation_window": self.config["oscillation_window"],
+        }
+        if env_cls is SnakeCnnEnv:
+            env_kwargs["channel_first"] = self.config["cnn_channel_first"]
+        env = env_cls(**env_kwargs)
         obs, _ = env.reset(seed=seed)
         frames = []
         max_score = 0

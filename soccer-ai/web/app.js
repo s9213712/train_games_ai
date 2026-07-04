@@ -1290,6 +1290,7 @@ function renderRl(data) {
   const goalkeeping = latest.goalkeeping || {};
   const rewards = latest.reward_terms || {};
   const league = data.league || {};
+  const guard = data.guard || {};
   const evaluation = data.evaluation || {};
   const opponent = latest.opponent || league.last_opponent || {};
   const evalRecord = evaluation.record || {};
@@ -1297,10 +1298,14 @@ function renderRl(data) {
   const rewardLine = ["score", "xg", "shot_quality", "territory", "defense", "discipline", "result"]
     .map((key) => `${key.replace("_", " ")} ${Number(rewards[key] || 0).toFixed(2)}`)
     .join(" · ");
+  const guardText = guard.episodes
+    ? `${guard.accepted ? "accepted" : "rejected"} · ${Number(guard.baseline_objective || 0).toFixed(2)} -> ${Number(guard.candidate_objective || 0).toFixed(2)}`
+    : "waiting";
   rl.box.innerHTML = [
     `<div>Mode <strong>${data.running ? "training" : "paused"}</strong> · Episode <strong>${data.episode || 0}</strong></div>`,
     `<div>Record <strong>${record.wins || 0}-${record.losses || 0}-${record.draws || 0}</strong> · Win <strong>${Math.round((record.win_rate || 0) * 100)}%</strong></div>`,
     `<div>League Elo <strong>${Math.round(league.elo || 1000)}</strong> · Pool <strong>${league.pool_size || 0}</strong> · Opp <strong>${opponent.name || "-"}</strong></div>`,
+    `<div>Guard <strong>${guardText}</strong></div>`,
     `<div>Eval <strong>${evalRecord.wins || 0}-${evalRecord.losses || 0}-${evalRecord.draws || 0}</strong> · GD <strong>${Number(evaluation.avg_goal_diff || 0).toFixed(2)}</strong> · xGD <strong>${Number(evaluation.avg_xg_diff || 0).toFixed(2)}</strong></div>`,
     `<div>Latest <strong>${score.blue ?? 0}-${score.red ?? 0}</strong> · xG <strong>${xg.blue ?? 0}-${xg.red ?? 0}</strong> · +<strong>${match.added_time || 0}</strong></div>`,
     `<div>Set pieces <strong>C ${restarts.blue_corners || 0}-${restarts.red_corners || 0}</strong> · FK <strong>${restarts.blue_free_kicks || 0}-${restarts.red_free_kicks || 0}</strong> · GK <strong>${restarts.blue_goal_kicks || 0}-${restarts.red_goal_kicks || 0}</strong></div>`,
@@ -1311,7 +1316,7 @@ function renderRl(data) {
     `<div>${data.last_event || "ready"}</div>`,
   ].join("");
   if (data.config) {
-    if (document.activeElement !== rl.rate) rl.rate.value = Number(data.config.learning_rate || 0.012).toFixed(3);
+    if (document.activeElement !== rl.rate) rl.rate.value = Number(data.config.learning_rate || 0.0008).toFixed(4);
     if (document.activeElement !== rl.selfPlay) rl.selfPlay.checked = Boolean(data.config.self_play);
     if (rl.league && document.activeElement !== rl.league) rl.league.checked = Boolean(data.config.league_enabled);
   }
@@ -1329,7 +1334,7 @@ if (rl.start) {
   rl.start.addEventListener("click", async () => renderRl(await rlApi("/api/rl/start", rlConfig())));
   rl.pause.addEventListener("click", async () => renderRl(await rlApi("/api/rl/pause", {})));
   rl.step.addEventListener("click", async () => {
-    renderRl(await rlApi("/api/rl/step", { episodes: 10 }));
+    renderRl(await rlApi("/api/rl/step", { episodes: 20, eval_episodes: 32 }));
     await loadBackendReplay();
   });
   rl.reset.addEventListener("click", async () => renderRl(await rlApi("/api/rl/reset", {})));

@@ -58,7 +58,7 @@ class TetrisHandler(BaseHTTPRequestHandler):
                 result = trainer.train_guarded_batch(
                     episodes,
                     eval_episodes=max(2, min(24, int(payload.get("eval_episodes", 2) or 2))),
-                    accept_ratio=max(0.7, min(1.1, float(payload.get("accept_ratio", 0.98) or 0.98))),
+                    accept_ratio=max(0.7, min(1.1, float(payload.get("accept_ratio", 1.0) or 1.0))),
                 )
                 data = trainer.snapshot()
                 data["step_result"] = result

@@ -52,12 +52,16 @@ class SoccerHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/rl/step":
                 episodes = max(1, min(250, int(payload.get("episodes", 1) or 1)))
+                eval_episodes = max(4, min(120, int(payload.get("eval_episodes", 0) or trainer.guard_eval_episodes)))
+                accept_margin = float(payload.get("accept_margin", trainer.guard_accept_margin) or trainer.guard_accept_margin)
                 trainer.pause()
-                latest = None
-                for _ in range(episodes):
-                    latest = trainer.train_episode()
+                result = trainer.train_guarded_batch(
+                    episodes,
+                    eval_episodes=eval_episodes,
+                    accept_margin=accept_margin,
+                )
                 data = trainer.snapshot()
-                data["step_latest"] = latest
+                data["step_result"] = result
                 self._json(data)
                 return
             if self.path == "/api/rl/evaluate":

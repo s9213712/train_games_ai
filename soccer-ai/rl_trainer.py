@@ -11,14 +11,17 @@ from soccer_env import ACTION_NAMES, TacticalSoccerEnv
 
 
 class SoftmaxPolicy:
-    def __init__(self, obs_dim: int, action_dim: int, *, seed: int = 7) -> None:
+    def __init__(self, obs_dim: int, action_dim: int, *, seed: int = 7, init_scale: float = 0.0) -> None:
         self.random = random.Random(seed)
         self.obs_dim = obs_dim
         self.action_dim = action_dim
-        self.weights = [
-            [self.random.uniform(-0.035, 0.035) for _ in range(obs_dim)]
-            for _ in range(action_dim)
-        ]
+        scale = max(0.0, float(init_scale))
+        self.weights = []
+        for _ in range(action_dim):
+            if scale > 0.0:
+                self.weights.append([self.random.uniform(-scale, scale) for _ in range(obs_dim)])
+            else:
+                self.weights.append([0.0 for _ in range(obs_dim)])
 
     def probabilities(self, obs: list[float]) -> list[float]:
         logits = [sum(w * x for w, x in zip(row, obs)) for row in self.weights]
@@ -66,6 +69,21 @@ class SoftmaxPolicy:
         episode_return = returns[0]
         return baseline * 0.94 + episode_return * 0.06
 
+    def imitate(self, trajectory: list[dict], *, learning_rate: float, target_action) -> float:
+        if learning_rate <= 0.0 or not trajectory:
+            return 0.0
+        total_loss = 0.0
+        for row in trajectory:
+            obs = row["obs"]
+            action = int(target_action(obs))
+            probs = self.probabilities(obs)
+            total_loss += -math.log(max(1e-8, probs[action]))
+            for action_index in range(self.action_dim):
+                scale = (1.0 if action_index == action else 0.0) - probs[action_index]
+                for obs_index in range(self.obs_dim):
+                    self.weights[action_index][obs_index] += learning_rate * scale * obs[obs_index]
+        return total_loss / len(trajectory)
+
     def top_actions(self, obs: list[float], limit: int = 4) -> list[dict]:
         probs = self.probabilities(obs)
         rows = sorted(enumerate(probs), key=lambda item: item[1], reverse=True)
@@ -111,11 +129,17 @@ class RLTrainer:
         self.thread: threading.Thread | None = None
         self.episode = 0
         self.baseline = 0.0
-        self.learning_rate = 0.012
+        self.learning_rate = 0.0008
         self.gamma = 0.985
         self.self_play = False
         self.league_enabled = True
         self.temperature = 1.15
+        self.guard_enabled = True
+        self.guard_batch_episodes = 20
+        self.guard_eval_episodes = 32
+        self.guard_accept_margin = 0.0
+        self.coach_enabled = True
+        self.coach_rate = 0.001
         self.elo = 1000.0
         self.scripted_elo = 950.0
         self.league_pool: list[dict] = []
@@ -124,14 +148,15 @@ class RLTrainer:
         self.latest_replay: list[dict] = []
         self.latest_info: dict = {}
         self.last_eval: dict = {}
+        self.last_guard: dict = {}
         self.last_event = "ready"
         self._load_checkpoint()
 
-    def train_episode(self) -> dict:
+    def train_episode(self, *, persist: bool = True) -> dict:
         with self.training_lock:
-            return self._train_episode()
+            return self._train_episode(persist=persist)
 
-    def _train_episode(self) -> dict:
+    def _train_episode(self, *, persist: bool = True) -> dict:
         with self.lock:
             episode_index = self.episode
             self.episode += 1
@@ -140,6 +165,8 @@ class RLTrainer:
             self_play = self.self_play
             temperature = self.temperature
             baseline = self.baseline
+            coach_enabled = self.coach_enabled
+            coach_rate = self.coach_rate
             opponent = self._select_opponent_locked(episode_index, self_play)
         env = TacticalSoccerEnv(seed=10_000 + episode_index)
         obs = env.reset()
@@ -167,6 +194,11 @@ class RLTrainer:
             obs = next_obs
 
         new_baseline = self.policy.update(trajectory, learning_rate=learning_rate, gamma=gamma, baseline=baseline)
+        coach_loss = (
+            self.policy.imitate(trajectory, learning_rate=coach_rate, target_action=self._coach_blue)
+            if coach_enabled
+            else 0.0
+        )
         if opponent["kind"] == "current_red":
             self.red_policy.update(red_trajectory, learning_rate=learning_rate * 0.7, gamma=gamma, baseline=-baseline)
         final = env.info()
@@ -178,6 +210,7 @@ class RLTrainer:
                 "reward": round(total_reward, 3),
                 "reward_terms": reward_totals,
                 "baseline": round(new_baseline, 3),
+                "coach_loss": round(coach_loss, 4),
                 "result": result,
                 "opponent": self._opponent_public(opponent),
                 "top_actions": self.policy.top_actions(env.observation()),
@@ -192,7 +225,8 @@ class RLTrainer:
             self.history.append(final)
             self.history = self.history[-200:]
             self.last_event = f"episode {episode_index}: {final['result']}"
-        self._persist(final, env.replay)
+        if persist:
+            self._persist(final, env.replay)
         return final
 
     def start(self) -> None:
@@ -226,16 +260,24 @@ class RLTrainer:
             self.history = []
             self.latest_replay = []
             self.latest_info = {}
+            self.last_eval = {}
+            self.last_guard = {}
             self.last_event = "reset"
         self._save_checkpoint()
 
     def update_config(self, payload: dict) -> None:
         with self.lock:
-            self.learning_rate = max(0.0005, min(0.08, float(payload.get("learning_rate", self.learning_rate))))
+            self.learning_rate = max(0.0001, min(0.02, float(payload.get("learning_rate", self.learning_rate))))
             self.gamma = max(0.8, min(0.999, float(payload.get("gamma", self.gamma))))
             self.temperature = max(0.25, min(2.5, float(payload.get("temperature", self.temperature))))
             self.self_play = bool(payload.get("self_play", self.self_play))
             self.league_enabled = bool(payload.get("league_enabled", self.league_enabled))
+            self.guard_enabled = bool(payload.get("guard_enabled", self.guard_enabled))
+            self.guard_batch_episodes = max(1, min(100, int(payload.get("guard_batch_episodes", self.guard_batch_episodes))))
+            self.guard_eval_episodes = max(4, min(120, int(payload.get("guard_eval_episodes", self.guard_eval_episodes))))
+            self.guard_accept_margin = max(-10.0, min(25.0, float(payload.get("guard_accept_margin", self.guard_accept_margin))))
+            self.coach_enabled = bool(payload.get("coach_enabled", self.coach_enabled))
+            self.coach_rate = max(0.0, min(0.05, float(payload.get("coach_rate", self.coach_rate))))
             self.last_event = "settings updated"
 
     def snapshot(self) -> dict:
@@ -254,7 +296,14 @@ class RLTrainer:
                     "temperature": self.temperature,
                     "self_play": self.self_play,
                     "league_enabled": self.league_enabled,
+                    "guard_enabled": self.guard_enabled,
+                    "guard_batch_episodes": self.guard_batch_episodes,
+                    "guard_eval_episodes": self.guard_eval_episodes,
+                    "guard_accept_margin": self.guard_accept_margin,
+                    "coach_enabled": self.coach_enabled,
+                    "coach_rate": self.coach_rate,
                 },
+                "guard": dict(self.last_guard),
                 "league": {
                     "elo": round(self.elo, 1),
                     "scripted_elo": round(self.scripted_elo, 1),
@@ -285,31 +334,142 @@ class RLTrainer:
         with self.lock:
             return {"frames": list(self.latest_replay), "latest": dict(self.latest_info)}
 
-    def evaluate(self, episodes: int = 20, opponent: str = "mixed") -> dict:
+    def train_guarded_batch(self, episodes: int, *, eval_episodes: int | None = None, accept_margin: float | None = None) -> dict:
         with self.training_lock:
-            return self._evaluate(episodes, opponent)
+            return self._train_guarded_batch(episodes, eval_episodes=eval_episodes, accept_margin=accept_margin)
 
-    def _evaluate(self, episodes: int = 20, opponent: str = "mixed") -> dict:
-        episodes = max(1, min(200, int(episodes)))
-        opponent = opponent if opponent in {"mixed", "scripted", "current_red", "league"} else "mixed"
+    def _train_guarded_batch(self, episodes: int, *, eval_episodes: int | None = None, accept_margin: float | None = None) -> dict:
+        episodes = max(1, min(250, int(episodes)))
+        eval_episodes = max(4, min(120, int(eval_episodes if eval_episodes is not None else self.guard_eval_episodes)))
+        accept_margin = float(self.guard_accept_margin if accept_margin is None else accept_margin)
         with self.lock:
-            blue_policy = self.policy.clone(seed=31)
-            red_policy = self.red_policy.clone(seed=37)
-            pool = [
-                {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "elo": row["elo"],
-                    "policy": row["policy"].clone(seed=41 + index),
-                }
-                for index, row in enumerate(self.league_pool)
-            ]
+            original = self._capture_state_locked()
             start_episode = self.episode
+            seeds = [830_000 + start_episode * 37 + index for index in range(eval_episodes)]
+        baseline = self._evaluate_policy(
+            original["policy"],
+            original["red_policy"],
+            original["league_pool"],
+            seeds,
+            opponent="scripted",
+        )
+        latest = None
+        for _ in range(episodes):
+            latest = self.train_episode(persist=False)
+        with self.lock:
+            candidate_policy = self.policy.clone(seed=71)
+            candidate_red = self.red_policy.clone(seed=73)
+            candidate_pool = self._clone_league_pool_locked()
+            candidate_replay = list(self.latest_replay)
+            candidate_latest = dict(self.latest_info)
+        candidate = self._evaluate_policy(candidate_policy, candidate_red, candidate_pool, seeds, opponent="scripted")
+        baseline_objective = self._guard_objective(baseline)
+        candidate_objective = self._guard_objective(candidate)
+        accepted = candidate_objective >= baseline_objective + accept_margin
+        guard = {
+            "accepted": accepted,
+            "episodes": episodes,
+            "eval_episodes": eval_episodes,
+            "accept_margin": round(accept_margin, 3),
+            "baseline_objective": round(baseline_objective, 3),
+            "candidate_objective": round(candidate_objective, 3),
+            "baseline_reward": baseline["avg_reward"],
+            "candidate_reward": candidate["avg_reward"],
+            "baseline_goal_diff": baseline["avg_goal_diff"],
+            "candidate_goal_diff": candidate["avg_goal_diff"],
+            "baseline_win_rate": baseline["record"]["win_rate"],
+            "candidate_win_rate": candidate["record"]["win_rate"],
+        }
+        with self.lock:
+            if accepted:
+                self.last_eval = candidate
+                self.last_guard = guard
+                if latest is None:
+                    latest = candidate_latest
+                latest["guard"] = guard
+                self.last_event = f"guard accepted {episodes}: {baseline_objective:.2f} -> {candidate_objective:.2f}"
+                self._persist(latest, candidate_replay)
+            else:
+                self._restore_state_locked(original)
+                self.last_guard = guard
+                self.last_event = f"guard rejected {episodes}: {candidate_objective:.2f} < {baseline_objective:.2f}"
+                self._save_checkpoint()
+        return {"accepted": accepted, "guard": guard, "baseline": baseline, "candidate": candidate, "latest": latest or {}}
+
+    def _capture_state_locked(self) -> dict:
+        return {
+            "policy": self.policy.clone(seed=61),
+            "red_policy": self.red_policy.clone(seed=63),
+            "episode": self.episode,
+            "baseline": self.baseline,
+            "elo": self.elo,
+            "scripted_elo": self.scripted_elo,
+            "league_pool": self._clone_league_pool_locked(),
+            "last_opponent": dict(self.last_opponent),
+            "history": list(self.history),
+            "latest_replay": list(self.latest_replay),
+            "latest_info": dict(self.latest_info),
+            "last_eval": dict(self.last_eval),
+            "last_guard": dict(self.last_guard),
+            "last_event": self.last_event,
+        }
+
+    def _restore_state_locked(self, state: dict) -> None:
+        self.policy = state["policy"]
+        self.red_policy = state["red_policy"]
+        self.episode = state["episode"]
+        self.baseline = state["baseline"]
+        self.elo = state["elo"]
+        self.scripted_elo = state["scripted_elo"]
+        self.league_pool = state["league_pool"]
+        self.last_opponent = dict(state["last_opponent"])
+        self.history = list(state["history"])
+        self.latest_replay = list(state["latest_replay"])
+        self.latest_info = dict(state["latest_info"])
+        self.last_eval = dict(state["last_eval"])
+        self.last_guard = dict(state["last_guard"])
+        self.last_event = state["last_event"]
+
+    def _clone_league_pool_locked(self) -> list[dict]:
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "elo": row["elo"],
+                "games": row.get("games", 0),
+                "wins": row.get("wins", 0),
+                "losses": row.get("losses", 0),
+                "draws": row.get("draws", 0),
+                "policy": row["policy"].clone(seed=81 + index),
+            }
+            for index, row in enumerate(self.league_pool)
+        ]
+
+    @staticmethod
+    def _guard_objective(evaluation: dict) -> float:
+        record = evaluation.get("record", {})
+        return (
+            float(evaluation.get("avg_reward", 0.0))
+            + float(evaluation.get("avg_goal_diff", 0.0)) * 6.0
+            + float(evaluation.get("avg_xg_diff", 0.0)) * 3.0
+            + float(record.get("win_rate", 0.0)) * 2.0
+            - float(record.get("loss_rate", 0.0)) * 2.0
+        )
+
+    def _evaluate_policy(
+        self,
+        blue_policy: SoftmaxPolicy,
+        red_policy: SoftmaxPolicy,
+        pool: list[dict],
+        seeds: list[int],
+        *,
+        opponent: str = "mixed",
+    ) -> dict:
         rows = []
         reward_totals: dict[str, float] = {}
         latest_replay: list[dict] = []
-        for index in range(episodes):
-            env = TacticalSoccerEnv(seed=700_000 + start_episode + index)
+        for index, seed in enumerate(seeds):
+            env = TacticalSoccerEnv(seed=seed)
             obs = env.reset()
             selected = self._evaluation_opponent(opponent, index, pool)
             total_reward = 0.0
@@ -339,12 +499,14 @@ class RLTrainer:
                 }
             )
             latest_replay = list(env.replay)
+        episodes = max(1, len(rows))
         wins = sum(1 for row in rows if row["result"] == "win")
         losses = sum(1 for row in rows if row["result"] == "loss")
         draws = episodes - wins - losses
         goal_diff = sum(row["score"]["blue"] - row["score"]["red"] for row in rows) / episodes
         xg_diff = sum(row["xg"]["blue"] - row["xg"]["red"] for row in rows) / episodes
-        evaluation = {
+        avg_reward = sum(row["reward"] for row in rows) / episodes
+        return {
             "episodes": episodes,
             "opponent": opponent,
             "record": {
@@ -352,7 +514,9 @@ class RLTrainer:
                 "losses": losses,
                 "draws": draws,
                 "win_rate": round(wins / episodes, 3),
+                "loss_rate": round(losses / episodes, 3),
             },
+            "avg_reward": round(avg_reward, 3),
             "avg_goal_diff": round(goal_diff, 3),
             "avg_xg_diff": round(xg_diff, 3),
             "avg_reward_terms": {key: round(value / episodes, 3) for key, value in sorted(reward_totals.items())},
@@ -360,6 +524,21 @@ class RLTrainer:
             "rows": rows[-40:],
             "replay_frames": len(latest_replay),
         }
+
+    def evaluate(self, episodes: int = 20, opponent: str = "mixed") -> dict:
+        with self.training_lock:
+            return self._evaluate(episodes, opponent)
+
+    def _evaluate(self, episodes: int = 20, opponent: str = "mixed") -> dict:
+        episodes = max(1, min(200, int(episodes)))
+        opponent = opponent if opponent in {"mixed", "scripted", "current_red", "league"} else "mixed"
+        with self.lock:
+            blue_policy = self.policy.clone(seed=31)
+            red_policy = self.red_policy.clone(seed=37)
+            pool = self._clone_league_pool_locked()
+            start_episode = self.episode
+        seeds = [700_000 + start_episode + index for index in range(episodes)]
+        evaluation = self._evaluate_policy(blue_policy, red_policy, pool, seeds, opponent=opponent)
         with self.lock:
             self.last_eval = evaluation
             self.last_event = f"evaluated {episodes} vs {opponent}"
@@ -381,7 +560,15 @@ class RLTrainer:
             if not active:
                 time.sleep(0.08)
                 continue
-            self.train_episode()
+            with self.lock:
+                guarded = self.guard_enabled
+                batch_episodes = self.guard_batch_episodes
+                eval_episodes = self.guard_eval_episodes
+                accept_margin = self.guard_accept_margin
+            if guarded:
+                self.train_guarded_batch(batch_episodes, eval_episodes=eval_episodes, accept_margin=accept_margin)
+            else:
+                self.train_episode()
             time.sleep(0.01)
 
     def _persist(self, metrics: dict, replay: list[dict]) -> None:
@@ -397,6 +584,12 @@ class RLTrainer:
             "elo": self.elo,
             "scripted_elo": self.scripted_elo,
             "league_enabled": self.league_enabled,
+            "guard_enabled": self.guard_enabled,
+            "guard_batch_episodes": self.guard_batch_episodes,
+            "guard_eval_episodes": self.guard_eval_episodes,
+            "guard_accept_margin": self.guard_accept_margin,
+            "coach_enabled": self.coach_enabled,
+            "coach_rate": self.coach_rate,
             "policy": self.policy.to_json(),
             "red_policy": self.red_policy.to_json(),
             "league_pool": [
@@ -425,6 +618,12 @@ class RLTrainer:
             self.elo = float(payload.get("elo", self.elo))
             self.scripted_elo = float(payload.get("scripted_elo", self.scripted_elo))
             self.league_enabled = bool(payload.get("league_enabled", self.league_enabled))
+            self.guard_enabled = bool(payload.get("guard_enabled", self.guard_enabled))
+            self.guard_batch_episodes = int(payload.get("guard_batch_episodes", self.guard_batch_episodes))
+            self.guard_eval_episodes = int(payload.get("guard_eval_episodes", self.guard_eval_episodes))
+            self.guard_accept_margin = float(payload.get("guard_accept_margin", self.guard_accept_margin))
+            self.coach_enabled = bool(payload.get("coach_enabled", self.coach_enabled))
+            self.coach_rate = float(payload.get("coach_rate", self.coach_rate))
             self.policy.load_json(dict(payload.get("policy") or {}))
             self.red_policy.load_json(dict(payload.get("red_policy") or {}))
             self.league_pool = []
@@ -560,6 +759,10 @@ class RLTrainer:
         if blue_stamina < 0.45:
             return ACTION_NAMES.index("high_press")
         return ACTION_NAMES.index("balanced")
+
+    @staticmethod
+    def _coach_blue(_obs: list[float]) -> int:
+        return ACTION_NAMES.index("possession")
 
     @staticmethod
     def _invert_obs(obs: list[float]) -> list[float]:

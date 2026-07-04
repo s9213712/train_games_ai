@@ -425,6 +425,7 @@ class Trainer:
         self.exploration = 0.08
         self.mutation = 0.12
         self.learning_rate = 0.025
+        self.teacher_learning_rate = 0.05
         self.discount = 0.94
         self.reset()
 
@@ -439,6 +440,7 @@ class Trainer:
             self.best_reward = -math.inf
             self.student_matches = 0
             self.teacher_samples = 0
+            self.teacher_updates = 0
             self.rl_samples = 0
             self.policy_updates = 0
             self.td_error_ema = 0.0
@@ -541,6 +543,24 @@ class Trainer:
         for key in FEATURE_KEYS:
             self.weights[key] = max(-2.0, min(3.0, self.weights[key] + rate * clipped * float(features.get(key, 0.0))))
 
+    def apply_teacher_update(self, board: chess.Board, chosen: chess.Move | None, teacher_move_uci: str) -> None:
+        if chosen is None or not teacher_move_uci:
+            return
+        try:
+            teacher_move = chess.Move.from_uci(teacher_move_uci)
+        except Exception:
+            return
+        if teacher_move not in board.legal_moves or chosen not in board.legal_moves or teacher_move == chosen:
+            return
+        teacher_features = move_features(board, teacher_move)
+        chosen_features = move_features(board, chosen)
+        rate = float(self.teacher_learning_rate)
+        for key in FEATURE_KEYS:
+            delta = teacher_features.get(key, 0.0) - chosen_features.get(key, 0.0)
+            self.weights[key] = max(-2.0, min(3.0, self.weights[key] + rate * delta))
+        self.teacher_updates += 1
+        self.policy_updates += 1
+
     def apply_episode_result_update(self, final_signal: float) -> None:
         if not self.episode_trace or abs(final_signal) < 0.0001:
             return
@@ -617,6 +637,7 @@ class Trainer:
                 diagnostic = self.record_teacher_diagnostic(pre_move_board, move, teacher)
                 if move is not None:
                     action_features = move_features(pre_move_board, move)
+                    self.apply_teacher_update(pre_move_board, move, str(teacher.get("best_move") or ""))
             else:
                 move = self.opponent_move(self.board, teacher)
             if move is None:
@@ -695,6 +716,7 @@ class Trainer:
             self.exploration = max(0.0, min(0.8, float(updates.get("exploration", self.exploration))))
             self.mutation = max(0.0, min(1.0, float(updates.get("mutation", self.mutation))))
             self.learning_rate = max(0.0, min(0.5, float(updates.get("learning_rate", self.learning_rate))))
+            self.teacher_learning_rate = max(0.0, min(0.5, float(updates.get("teacher_learning_rate", self.teacher_learning_rate))))
             weights = updates.get("weights")
             if isinstance(weights, dict):
                 for key in self.weights:
@@ -725,13 +747,15 @@ class Trainer:
                     "teacher_samples": self.teacher_samples,
                     "matches": self.student_matches,
                     "match_rate": round(match_rate, 4),
-                    "teacher_fit_used": False,
+                    "teacher_fit_used": True,
+                    "teacher_updates": self.teacher_updates,
                     "loss": round(abs(self.td_error_ema), 4),
                     "td_error": round(self.td_error_ema, 4),
                     "last_td_error": round(self.last_td_error, 4),
                     "updates": self.policy_updates,
                     "buffer": len(self.teacher_buffer),
                     "learning_rate": self.learning_rate,
+                    "teacher_learning_rate": self.teacher_learning_rate,
                     "discount": self.discount,
                     "strength": strength,
                     "completed_games": self.completed_games,
@@ -757,6 +781,7 @@ class Trainer:
                     "exploration": self.exploration,
                     "mutation": self.mutation,
                     "learning_rate": self.learning_rate,
+                    "teacher_learning_rate": self.teacher_learning_rate,
                 },
                 "last_event": self.last_event,
                 "last_error": self.last_error,

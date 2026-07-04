@@ -219,6 +219,11 @@ class RLTrainer:
         self.lookahead_weight = 0.1
         self.lookahead_candidates = 4
         self.lookahead_include_hold = False
+        self.train_max_pieces = 360
+        self.eval_max_pieces = 900
+        self.guard_max_pieces = 240
+        self.background_guard_episodes = 2
+        self.background_eval_episodes = 2
         self.best_score = 0
         self.best_lines = 0
         self.history: list[dict] = []
@@ -245,7 +250,7 @@ class RLTrainer:
             lookahead_candidates = self.lookahead_candidates
             lookahead_include_hold = self.lookahead_include_hold
             target_policy = self.target_policy.clone()
-        env = TetrisEnv(seed=100_000 + episode)
+        env = TetrisEnv(seed=100_000 + episode, max_pieces=self.train_max_pieces)
         env.reset()
         total_reward = 0.0
         errors = []
@@ -328,7 +333,16 @@ class RLTrainer:
             lookahead_weight = self.lookahead_weight
             lookahead_candidates = self.lookahead_candidates
             include_hold = self.lookahead_include_hold if lookahead_include_hold is None else bool(lookahead_include_hold)
-        evaluation = self._evaluate_policy(policy, episodes, start, lookahead_weight, lookahead_candidates, include_hold, capture_replay=True)
+        evaluation = self._evaluate_policy(
+            policy,
+            episodes,
+            start,
+            lookahead_weight,
+            lookahead_candidates,
+            include_hold,
+            capture_replay=True,
+            max_pieces=self.eval_max_pieces,
+        )
         evaluation["future_hold"] = include_hold
         latest_replay = evaluation.pop("_latest_replay", [])
         with self.lock:
@@ -370,7 +384,15 @@ class RLTrainer:
             lookahead_weight = self.lookahead_weight
             lookahead_candidates = self.lookahead_candidates
             lookahead_include_hold = self.lookahead_include_hold
-        baseline = self._evaluate_policy(original["policy"], eval_episodes, start, lookahead_weight, lookahead_candidates, lookahead_include_hold)
+        baseline = self._evaluate_policy(
+            original["policy"],
+            eval_episodes,
+            start,
+            lookahead_weight,
+            lookahead_candidates,
+            lookahead_include_hold,
+            max_pieces=self.guard_max_pieces,
+        )
         latest = None
         for _ in range(episodes):
             latest = self.train_episode(persist=False)
@@ -378,7 +400,15 @@ class RLTrainer:
             candidate_policy = self.policy.clone()
             candidate_replay = list(self.latest_replay)
             candidate_latest = dict(self.latest_info)
-        candidate = self._evaluate_policy(candidate_policy, eval_episodes, start, lookahead_weight, lookahead_candidates, lookahead_include_hold)
+        candidate = self._evaluate_policy(
+            candidate_policy,
+            eval_episodes,
+            start,
+            lookahead_weight,
+            lookahead_candidates,
+            lookahead_include_hold,
+            max_pieces=self.guard_max_pieces,
+        )
         baseline_objective = self._guard_objective(baseline)
         candidate_objective = self._guard_objective(candidate)
         accepted = candidate_objective >= baseline_objective * accept_ratio
@@ -433,11 +463,13 @@ class RLTrainer:
         lookahead_candidates: int,
         lookahead_include_hold: bool,
         capture_replay: bool = False,
+        max_pieces: int | None = None,
     ) -> dict:
         rows = []
         latest_replay = []
+        piece_limit = max(40, min(1200, int(max_pieces or 900)))
         for index in range(episodes):
-            env = TetrisEnv(seed=800_000 + start + index)
+            env = TetrisEnv(seed=800_000 + start + index, max_pieces=piece_limit)
             env.reset()
             done = False
             total_reward = 0.0
@@ -482,6 +514,7 @@ class RLTrainer:
             "best_tetrises": max(row["tetrises"] for row in rows),
             "rows": rows[-60:],
             "replay_frames": len(latest_replay),
+            "max_pieces": piece_limit,
         }
         if capture_replay:
             evaluation["_latest_replay"] = latest_replay
@@ -536,6 +569,11 @@ class RLTrainer:
             self.lookahead_weight = max(0.0, min(0.95, float(payload.get("lookahead_weight", self.lookahead_weight))))
             self.lookahead_candidates = max(0, min(40, int(payload.get("lookahead_candidates", self.lookahead_candidates))))
             self.lookahead_include_hold = bool(payload.get("lookahead_include_hold", self.lookahead_include_hold))
+            self.train_max_pieces = max(40, min(1200, int(payload.get("train_max_pieces", self.train_max_pieces))))
+            self.eval_max_pieces = max(40, min(1200, int(payload.get("eval_max_pieces", self.eval_max_pieces))))
+            self.guard_max_pieces = max(40, min(1200, int(payload.get("guard_max_pieces", self.guard_max_pieces))))
+            self.background_guard_episodes = max(1, min(20, int(payload.get("background_guard_episodes", self.background_guard_episodes))))
+            self.background_eval_episodes = max(2, min(24, int(payload.get("background_eval_episodes", self.background_eval_episodes))))
             self.last_event = "settings updated"
 
     def snapshot(self) -> dict:
@@ -558,6 +596,11 @@ class RLTrainer:
                     "lookahead_weight": self.lookahead_weight,
                     "lookahead_candidates": self.lookahead_candidates,
                     "lookahead_include_hold": self.lookahead_include_hold,
+                    "train_max_pieces": self.train_max_pieces,
+                    "eval_max_pieces": self.eval_max_pieces,
+                    "guard_max_pieces": self.guard_max_pieces,
+                    "background_guard_episodes": self.background_guard_episodes,
+                    "background_eval_episodes": self.background_eval_episodes,
                 },
                 "guard": dict(self.last_guard),
                 "record": {
@@ -617,7 +660,10 @@ class RLTrainer:
             if not active:
                 time.sleep(0.08)
                 continue
-            self.train_episode()
+            with self.lock:
+                batch_episodes = self.background_guard_episodes
+                eval_episodes = self.background_eval_episodes
+            self.train_guarded_batch(batch_episodes, eval_episodes=eval_episodes, accept_ratio=1.0)
             time.sleep(0.01)
 
     def _persist(self, metrics: dict, replay: list[dict]) -> None:
@@ -641,6 +687,11 @@ class RLTrainer:
                 "lookahead_weight": self.lookahead_weight,
                 "lookahead_candidates": self.lookahead_candidates,
                 "lookahead_include_hold": self.lookahead_include_hold,
+                "train_max_pieces": self.train_max_pieces,
+                "eval_max_pieces": self.eval_max_pieces,
+                "guard_max_pieces": self.guard_max_pieces,
+                "background_guard_episodes": self.background_guard_episodes,
+                "background_eval_episodes": self.background_eval_episodes,
             },
             "policy": self.policy.to_json(),
             "target_policy": self.target_policy.to_json(),
@@ -667,6 +718,11 @@ class RLTrainer:
             self.lookahead_weight = float(config.get("lookahead_weight", self.lookahead_weight))
             self.lookahead_candidates = int(config.get("lookahead_candidates", self.lookahead_candidates))
             self.lookahead_include_hold = bool(config.get("lookahead_include_hold", self.lookahead_include_hold))
+            self.train_max_pieces = int(config.get("train_max_pieces", self.train_max_pieces))
+            self.eval_max_pieces = int(config.get("eval_max_pieces", self.eval_max_pieces))
+            self.guard_max_pieces = int(config.get("guard_max_pieces", self.guard_max_pieces))
+            self.background_guard_episodes = int(config.get("background_guard_episodes", self.background_guard_episodes))
+            self.background_eval_episodes = int(config.get("background_eval_episodes", self.background_eval_episodes))
             if migrating_old_config:
                 self.learning_rate = min(self.learning_rate, 0.0005)
                 self.epsilon = min(self.epsilon, 0.015)
