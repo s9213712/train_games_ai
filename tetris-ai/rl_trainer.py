@@ -202,6 +202,7 @@ class RLTrainer:
         self.best_policy = self.policy.clone()
         self.checkpoint_path = self.runtime / "tetris_policy.json"
         self.best_checkpoint_path = self.runtime / "tetris_policy.best.json"
+        self.best_score_checkpoint_path = self.runtime / "tetris_policy.best_score.json"
         self.metrics_path = self.runtime / "training_metrics.jsonl"
         self.replay_path = self.runtime / "latest_replay.json"
         self.eval_path = self.runtime / "latest_evaluation.json"
@@ -227,6 +228,7 @@ class RLTrainer:
         self.background_eval_episodes = 2
         self.best_score = 0
         self.best_lines = 0
+        self.best_guard_objective = -math.inf
         self.history: list[dict] = []
         self.latest_info: dict = {}
         self.latest_replay: list[dict] = []
@@ -310,7 +312,7 @@ class RLTrainer:
                 self.best_policy = self.policy.clone()
                 final["new_best"] = True
                 if persist:
-                    self._save_best_checkpoint()
+                    self._save_best_score_checkpoint()
             elif previous_best_score and final["score"] < previous_best_score * 0.55:
                 self.policy.soft_update_from(self.best_policy, self.elite_anchor)
                 self.target_policy.soft_update_from(self.best_policy, self.elite_anchor * 0.5)
@@ -436,7 +438,13 @@ class RLTrainer:
                 if latest is None:
                     latest = candidate_latest
                 latest["guard"] = guard
-                self._save_best_checkpoint(objective=candidate_objective)
+                if candidate_objective >= self.best_guard_objective:
+                    self.best_guard_objective = candidate_objective
+                    self._save_best_checkpoint(
+                        objective=candidate_objective,
+                        policy=self.policy,
+                        target_policy=self.target_policy,
+                    )
                 self._persist(latest, candidate_replay)
             else:
                 self.policy = original["policy"]
@@ -614,6 +622,7 @@ class RLTrainer:
                     "avg_tetrises": round(avg_tetrises, 3),
                     "best_score": self.best_score,
                     "best_lines": self.best_lines,
+                    "best_guard_objective": None if not math.isfinite(self.best_guard_objective) else round(self.best_guard_objective, 2),
                 },
                 "latest": dict(self.latest_info),
                 "evaluation": dict(self.last_eval),
@@ -621,6 +630,7 @@ class RLTrainer:
                 "weights": self.weight_summary(),
                 "checkpoint": str(self.checkpoint_path),
                 "best_checkpoint": str(self.best_checkpoint_path),
+                "best_score_checkpoint": str(self.best_score_checkpoint_path),
                 "replay_frames": len(self.latest_replay),
             }
 
@@ -682,6 +692,7 @@ class RLTrainer:
             "episode": self.episode,
             "best_score": self.best_score,
             "best_lines": self.best_lines,
+            "best_guard_objective": None if not math.isfinite(self.best_guard_objective) else self.best_guard_objective,
             "config": {
                 "learning_rate": self.learning_rate,
                 "gamma": self.gamma,
@@ -704,9 +715,17 @@ class RLTrainer:
         }
         self.checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         if self.best_score > 0:
-            self._save_best_checkpoint()
+            self._save_best_score_checkpoint()
 
-    def _save_best_checkpoint(self, *, objective: float | None = None) -> None:
+    def _save_best_checkpoint(
+        self,
+        *,
+        objective: float | None = None,
+        policy: AfterstateValue | None = None,
+        target_policy: AfterstateValue | None = None,
+    ) -> None:
+        save_policy = policy or self.policy
+        save_target = target_policy or self.target_policy
         payload = {
             "episode": self.episode,
             "objective": objective,
@@ -728,11 +747,22 @@ class RLTrainer:
                 "background_guard_episodes": self.background_guard_episodes,
                 "background_eval_episodes": self.background_eval_episodes,
             },
+            "policy": save_policy.to_json(),
+            "target_policy": save_target.to_json(),
+            "best_policy": self.best_policy.to_json(),
+        }
+        self.best_checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _save_best_score_checkpoint(self) -> None:
+        payload = {
+            "episode": self.episode,
+            "best_score": self.best_score,
+            "best_lines": self.best_lines,
             "policy": self.best_policy.to_json(),
             "target_policy": self.best_policy.to_json(),
             "best_policy": self.best_policy.to_json(),
         }
-        self.best_checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.best_score_checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _load_checkpoint(self) -> None:
         if not self.checkpoint_path.exists():
@@ -742,6 +772,9 @@ class RLTrainer:
             self.episode = int(payload.get("episode", 0))
             self.best_score = int(payload.get("best_score", 0))
             self.best_lines = int(payload.get("best_lines", 0))
+            best_guard_objective = payload.get("best_guard_objective")
+            if best_guard_objective is not None:
+                self.best_guard_objective = float(best_guard_objective)
             config = dict(payload.get("config") or {})
             migrating_old_config = "elite_anchor" not in config
             self.learning_rate = float(config.get("learning_rate", self.learning_rate))

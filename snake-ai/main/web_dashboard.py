@@ -33,7 +33,7 @@ MAIN_DIR = ROOT_DIR / "main"
 ORIGINAL_MODEL_DIR = MAIN_DIR / "original_models"
 FULLBOARD_CNN_MODEL = MAIN_DIR / "trained_models_cnn_oracle_bc" / "ppo_snake_bc_final_12x12.zip"
 RUNTIME_DIR = ROOT_DIR / "runtime"
-BEST_MODEL_PATH = RUNTIME_DIR / "snake_policy.best.zip"
+BEST_MODEL_PATH = RUNTIME_DIR / "snake_policy.best.snakeai.zip"
 MAX_MODEL_UPLOAD_BYTES = int(os.environ.get("SNAKE_MAX_MODEL_UPLOAD_BYTES", str(128 * 1024 * 1024)))
 MODEL_UPLOAD_ENABLED = os.environ.get("SNAKE_ENABLE_MODEL_UPLOAD", "").strip().lower() in {
     "1",
@@ -210,27 +210,43 @@ class TrainingDashboard:
             self.last_error = None
             self.last_event = "reset"
 
+    def _model_bundle_metadata(self, *, extra=None):
+        metadata = {
+            "format": "snake-ai-dashboard-bundle",
+            "format_version": 1,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "config": dict(self.config),
+            "trained_steps": int(self.model.num_timesteps) if self.model is not None else self.trained_steps,
+            "iteration": self.iteration,
+            "history": self.history[-200:],
+            "best": {
+                "score": self.best_score,
+                "steps": self.best_score_steps,
+                "trained_steps": self.best_score_trained_steps,
+                "iteration": self.best_score_iteration,
+                "guard_objective": None if self.best_guard_objective == float("-inf") else self.best_guard_objective,
+            },
+            "last_event": self.last_event,
+        }
+        if extra:
+            metadata.update(extra)
+        return metadata
+
+    def _write_model_bundle(self, destination: Path, metadata: dict) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "model.zip"
+            self.model.save(model_path)
+            with zipfile.ZipFile(destination, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
+                bundle.write(model_path, "model.zip")
+                bundle.writestr("metadata.json", json.dumps(metadata, indent=2))
+
     def export_model_bundle(self):
         with self.model_io_lock:
             with self.lock:
                 if self.model is None:
                     raise ValueError("No model has been created yet. Start training before downloading.")
-                metadata = {
-                    "format": "snake-ai-dashboard-bundle",
-                    "format_version": 1,
-                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "config": dict(self.config),
-                    "trained_steps": self.trained_steps,
-                    "iteration": self.iteration,
-                    "history": self.history[-200:],
-                    "best": {
-                        "score": self.best_score,
-                        "steps": self.best_score_steps,
-                        "trained_steps": self.best_score_trained_steps,
-                        "iteration": self.best_score_iteration,
-                    },
-                    "last_event": self.last_event,
-                }
+                metadata = self._model_bundle_metadata()
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 model_path = Path(tmpdir) / "model.zip"
@@ -267,7 +283,7 @@ class TrainingDashboard:
                         or metadata_info.file_size > 1024 * 1024
                     ):
                         raise ValueError("Uploaded model bundle contents are too large.")
-                    uploaded_zip.extract("model.zip", tmpdir)
+                    model_path.write_bytes(uploaded_zip.read("model.zip"))
                     metadata = json.loads(uploaded_zip.read("metadata.json").decode("utf-8"))
                 else:
                     model_path.write_bytes(upload_path.read_bytes())
@@ -786,10 +802,6 @@ class TrainingDashboard:
                                 accepted = candidate["objective"] >= baseline["objective"] + min_delta
                                 if not accepted:
                                     self.model = self._load_model(checkpoint, self.train_env, self.model.device)
-                                elif candidate["objective"] >= self.best_guard_objective:
-                                    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-                                    self.model.save(BEST_MODEL_PATH)
-                                    self.best_guard_objective = candidate["objective"]
                                 guard = {
                                     "accepted": accepted,
                                     "episodes": guard_episodes,
@@ -797,7 +809,22 @@ class TrainingDashboard:
                                     "min_delta": min_delta,
                                     "baseline": baseline,
                                     "candidate": candidate,
+                                    "eval_seed_base": guard_seed,
+                                    "eval_env_wrappers": ["raw_env", "manual_action_mask"],
                                 }
+                                if accepted and candidate["objective"] >= self.best_guard_objective:
+                                    self.best_guard_objective = candidate["objective"]
+                                    self._write_model_bundle(
+                                        BEST_MODEL_PATH,
+                                        self._model_bundle_metadata(
+                                            extra={
+                                                "guard_objective": candidate["objective"],
+                                                "guard": guard,
+                                                "eval_seed_base": guard_seed,
+                                                "eval_env_wrappers": ["raw_env", "manual_action_mask"],
+                                            }
+                                        ),
+                                    )
                 elapsed = max(0.001, time.time() - start)
                 end_steps = int(self.model.num_timesteps) if self.model is not None else start_steps
                 trained_delta = max(0, end_steps - start_steps)

@@ -34,6 +34,7 @@ class SoccerHandler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             if self.path == "/api/rl/start":
+                trainer.update_config(payload)
                 trainer.start()
                 self._json(trainer.snapshot())
                 return
@@ -97,6 +98,8 @@ class SoccerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(raw)
 
@@ -117,6 +120,8 @@ class SoccerHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mimetypes.guess_type(str(target))[0] or "application/octet-stream")
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(content)
 

@@ -379,6 +379,7 @@ class RLTrainer:
             "episodes": episodes,
             "eval_episodes": eval_episodes,
             "opponent": guard_opponent,
+            "opponent_distribution": candidate.get("opponent_distribution", {}),
             "accept_margin": round(accept_margin, 3),
             "baseline_objective": round(baseline_objective, 3),
             "candidate_objective": round(candidate_objective, 3),
@@ -388,6 +389,7 @@ class RLTrainer:
             "candidate_goal_diff": candidate["avg_goal_diff"],
             "baseline_win_rate": baseline["record"]["win_rate"],
             "candidate_win_rate": candidate["record"]["win_rate"],
+            "reward_audit": self._reward_audit(candidate),
         }
         with self.lock:
             if accepted:
@@ -466,6 +468,21 @@ class RLTrainer:
             - float(record.get("loss_rate", 0.0)) * 2.0
         )
 
+    @staticmethod
+    def _reward_audit(evaluation: dict) -> dict:
+        terms = dict(evaluation.get("avg_reward_terms") or {})
+        total_abs = sum(abs(float(value)) for value in terms.values()) or 1.0
+        shares = {
+            key: round(abs(float(value)) / total_abs, 3)
+            for key, value in sorted(terms.items())
+        }
+        warnings = []
+        if float(evaluation.get("avg_goal_diff", 0.0)) < 0.0 and (
+            shares.get("territory", 0.0) + shares.get("xg", 0.0)
+        ) > 0.45:
+            warnings.append("objective improved while goal differential is negative; inspect shaping terms")
+        return {"term_abs_share": shares, "warnings": warnings}
+
     def _evaluate_policy(
         self,
         blue_policy: SoftmaxPolicy,
@@ -477,11 +494,13 @@ class RLTrainer:
     ) -> dict:
         rows = []
         reward_totals: dict[str, float] = {}
+        opponent_distribution = {"scripted": 0, "current_red": 0, "league": 0}
         latest_replay: list[dict] = []
         for index, seed in enumerate(seeds):
             env = TacticalSoccerEnv(seed=seed)
             obs = env.reset()
             selected = self._evaluation_opponent(opponent, index, pool)
+            opponent_distribution[selected["kind"]] = opponent_distribution.get(selected["kind"], 0) + 1
             total_reward = 0.0
             done = False
             latest_info = {}
@@ -530,6 +549,7 @@ class RLTrainer:
             "avg_goal_diff": round(goal_diff, 3),
             "avg_xg_diff": round(xg_diff, 3),
             "avg_reward_terms": {key: round(value / episodes, 3) for key, value in sorted(reward_totals.items())},
+            "opponent_distribution": opponent_distribution,
             "latest": rows[-1] if rows else {},
             "rows": rows[-40:],
             "replay_frames": len(latest_replay),

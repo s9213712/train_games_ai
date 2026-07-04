@@ -33,6 +33,8 @@ Dashboard controls:
 Runtime outputs:
 
 - `runtime/tetris_policy.json`: TD value weights and config.
+- `runtime/tetris_policy.best.json`: best guarded policy accepted by fixed-seed objective.
+- `runtime/tetris_policy.best_score.json`: best single-episode score policy.
 - `runtime/training_metrics.jsonl`: score, lines, reward, TD error, features, and weights per episode.
 - `runtime/latest_replay.json`: latest training episode frames.
 - `runtime/latest_evaluation.json`: latest frozen evaluation summary.
@@ -42,6 +44,14 @@ The feature vector includes cleared lines, aggregate height, max height, holes, 
 The default TD rate is intentionally conservative (`0.0005`). Earlier higher-rate runs learned basic survival but tended to drift into short-term line clears with few tetrises, and later caused value drift after the 15-feature upgrade. The trainer now keeps an elite policy anchor: if a training episode falls far below the historical best, the live value function is nudged back toward the best saved policy. The current shaping gives credit to safe right-side well preparation and four-line clears, while the checkpoint loader remaps older 11-feature policies into the newer 15-feature representation. The dashboard reports average tetrises separately because score can improve without learning the four-line-clear strategy.
 
 Manual batch training is guarded. The trainer snapshots the current policy, trains a candidate policy without writing it immediately, evaluates baseline and candidate with fixed seeds, and rolls back if the candidate objective falls below the acceptance threshold. This keeps exploratory batches from overwriting a good policy after a few unlucky or unstable TD updates. The dashboard uses smaller guarded batches now because hold-enabled games survive much longer than the earlier one-piece-only environment.
+
+For a stricter multi-seed benchmark, run:
+
+```bash
+python3 evaluate_policy.py --episodes 100 --seeds 1000:1099 --future-hold
+```
+
+The CLI prints JSON with average, median, p10/p90 score, average tetrises, top-out rate, piece-cap hit rate, and per-seed rows. It is intended for release/best-policy checks rather than the fast interactive dashboard guard.
 
 The hold-enabled evaluator avoids duplicate terminal-check move enumeration and caches duplicate future-board lookahead calls inside each action selection. This keeps the stronger hold policy usable in the interactive dashboard without changing the policy semantics.
 

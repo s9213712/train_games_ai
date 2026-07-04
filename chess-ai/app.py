@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import os
 import random
@@ -596,6 +597,62 @@ class Trainer:
             "match_rate": round(matches / count, 4),
         }
 
+    def _capture_state_locked(self) -> dict:
+        return {
+            "board": self.board.copy(stack=True),
+            "weights": dict(self.weights),
+            "best_weights": dict(self.best_weights),
+            "game": self.game,
+            "ply": self.ply,
+            "reward": self.reward,
+            "best_reward": self.best_reward,
+            "student_matches": self.student_matches,
+            "teacher_samples": self.teacher_samples,
+            "teacher_updates": self.teacher_updates,
+            "rl_samples": self.rl_samples,
+            "policy_updates": self.policy_updates,
+            "td_error_ema": self.td_error_ema,
+            "last_td_error": self.last_td_error,
+            "teacher_buffer": copy.deepcopy(self.teacher_buffer),
+            "episode_trace": copy.deepcopy(self.episode_trace),
+            "completed_games": self.completed_games,
+            "white_wins": self.white_wins,
+            "black_wins": self.black_wins,
+            "draws": self.draws,
+            "history": copy.deepcopy(self.history),
+            "moves": copy.deepcopy(self.moves),
+            "teacher": dict(self.teacher),
+            "last_event": self.last_event,
+            "last_error": self.last_error,
+        }
+
+    def _restore_state_locked(self, state: dict) -> None:
+        self.board = state["board"].copy(stack=True)
+        self.weights = dict(state["weights"])
+        self.best_weights = dict(state["best_weights"])
+        self.game = state["game"]
+        self.ply = state["ply"]
+        self.reward = state["reward"]
+        self.best_reward = state["best_reward"]
+        self.student_matches = state["student_matches"]
+        self.teacher_samples = state["teacher_samples"]
+        self.teacher_updates = state["teacher_updates"]
+        self.rl_samples = state["rl_samples"]
+        self.policy_updates = state["policy_updates"]
+        self.td_error_ema = state["td_error_ema"]
+        self.last_td_error = state["last_td_error"]
+        self.teacher_buffer = copy.deepcopy(state["teacher_buffer"])
+        self.episode_trace = copy.deepcopy(state["episode_trace"])
+        self.completed_games = state["completed_games"]
+        self.white_wins = state["white_wins"]
+        self.black_wins = state["black_wins"]
+        self.draws = state["draws"]
+        self.history = copy.deepcopy(state["history"])
+        self.moves = copy.deepcopy(state["moves"])
+        self.teacher = dict(state["teacher"])
+        self.last_event = state["last_event"]
+        self.last_error = state["last_error"]
+
     def apply_episode_result_update(self, final_signal: float) -> None:
         if not self.episode_trace or abs(final_signal) < 0.0001:
             return
@@ -661,8 +718,8 @@ class Trainer:
             return {"enabled": False, "steps": count}
         with self.step_lock:
             with self.lock:
-                before_weights = dict(self.weights)
-            baseline = self.evaluate_teacher_gap(before_weights)
+                before_state = self._capture_state_locked()
+            baseline = self.evaluate_teacher_gap(before_state["weights"])
             for _ in range(count):
                 self._step_once()
             with self.lock:
@@ -679,7 +736,7 @@ class Trainer:
             }
             with self.lock:
                 if not accepted:
-                    self.weights = before_weights
+                    self._restore_state_locked(before_state)
                 self.last_guard = guard
                 self.last_event = (
                     f"guard accepted {baseline['avg_gap']:.1f}->{candidate['avg_gap']:.1f}"
