@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import os
 import random
@@ -18,6 +19,9 @@ from flask import Flask, jsonify, request, send_from_directory
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
+RUNTIME_DIR = ROOT / "runtime"
+CHECKPOINT_PATH = RUNTIME_DIR / "chess_policy.json"
+BEST_CHECKPOINT_PATH = RUNTIME_DIR / "chess_policy.best.json"
 
 PIECE_VALUES = {
     chess.PAWN: 100,
@@ -423,6 +427,8 @@ class Trainer:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.step_lock = threading.RLock()
+        self.checkpoint_path = CHECKPOINT_PATH
+        self.best_checkpoint_path = BEST_CHECKPOINT_PATH
         self.running = False
         self.thread: threading.Thread | None = None
         self.stop_requested = False
@@ -440,7 +446,7 @@ class Trainer:
         self.discount = 0.94
         self.reset()
 
-    def reset(self) -> None:
+    def reset(self, *, load_checkpoint: bool = True) -> None:
         with self.lock:
             self.board = chess.Board()
             self.weights = dict(DEFAULT_WEIGHTS)
@@ -468,6 +474,136 @@ class Trainer:
             self.teacher = {"available": False, "source": "none", "best_move": "", "eval_cp": 0, "lines": []}
             self.last_event = "reset"
             self.last_error = ""
+            self.loaded_checkpoint: dict = {}
+            if load_checkpoint:
+                self._load_checkpoint_locked()
+
+    def _sanitize_weights(self, payload: dict | None) -> dict[str, float] | None:
+        if not isinstance(payload, dict):
+            return None
+        weights = {}
+        for key in FEATURE_KEYS:
+            if key not in payload:
+                return None
+            weights[key] = max(-2.0, min(3.0, float(payload[key])))
+        return weights
+
+    def _checkpoint_payload_locked(self, *, teacher: str = "dashboard", extra: dict | None = None) -> dict:
+        payload = {
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "teacher": teacher,
+            "stockfish_path": self.stockfish_path,
+            "weights": dict(self.weights),
+            "best_weights": dict(self.best_weights),
+            "best_reward": None if not math.isfinite(self.best_reward) else self.best_reward,
+            "learning": {
+                "game": self.game,
+                "ply": self.ply,
+                "teacher_samples": self.teacher_samples,
+                "teacher_updates": self.teacher_updates,
+                "student_matches": self.student_matches,
+                "rl_samples": self.rl_samples,
+                "policy_updates": self.policy_updates,
+                "completed_games": self.completed_games,
+                "wins": self.white_wins,
+                "losses": self.black_wins,
+                "draws": self.draws,
+            },
+            "config": {
+                "teacher_depth": self.teacher_depth,
+                "student_depth": self.student_depth,
+                "chunk_moves": self.chunk_moves,
+                "exploration": self.exploration,
+                "mutation": self.mutation,
+                "learning_rate": self.learning_rate,
+                "teacher_learning_rate": self.teacher_learning_rate,
+                "guard_enabled": self.guard_enabled,
+                "guard_min_gap_delta": self.guard_min_gap_delta,
+                "discount": self.discount,
+            },
+            "guard": dict(self.last_guard),
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def _save_checkpoint_locked(self) -> None:
+        self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._checkpoint_payload_locked()
+        self.checkpoint_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _save_fallback_best_checkpoint_locked(self, guard: dict) -> None:
+        candidate = dict(guard.get("candidate") or {})
+        if not candidate:
+            return
+        if self.best_checkpoint_path.exists():
+            try:
+                current = json.loads(self.best_checkpoint_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                current = {}
+            current_teacher = str(current.get("teacher") or "")
+            if current_teacher and current_teacher not in {"fallback", "fallback_guard"}:
+                return
+            current_gap = float((current.get("final") or current.get("candidate") or {}).get("avg_gap", math.inf))
+            if float(candidate.get("avg_gap", math.inf)) >= current_gap:
+                return
+        payload = self._checkpoint_payload_locked(
+            teacher="fallback_guard",
+            extra={
+                "guard": dict(guard),
+                "baseline": dict(guard.get("baseline") or {}),
+                "final": candidate,
+            },
+        )
+        self.best_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        self.best_checkpoint_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _load_checkpoint_locked(self) -> None:
+        load_error = ""
+        for path in (self.best_checkpoint_path, self.checkpoint_path):
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                weights = self._sanitize_weights(payload.get("weights"))
+                if weights is None:
+                    continue
+                best_weights = self._sanitize_weights(payload.get("best_weights")) or weights
+                self.weights = dict(weights)
+                self.best_weights = dict(best_weights)
+                if payload.get("best_reward") is not None:
+                    self.best_reward = float(payload["best_reward"])
+                learning = dict(payload.get("learning") or {})
+                self.game = int(learning.get("game", self.game))
+                self.teacher_samples = int(learning.get("teacher_samples", self.teacher_samples))
+                self.teacher_updates = int(learning.get("teacher_updates", self.teacher_updates))
+                self.student_matches = int(learning.get("student_matches", self.student_matches))
+                self.rl_samples = int(learning.get("rl_samples", self.rl_samples))
+                self.policy_updates = int(learning.get("policy_updates", self.policy_updates))
+                self.completed_games = int(learning.get("completed_games", self.completed_games))
+                self.white_wins = int(learning.get("wins", self.white_wins))
+                self.black_wins = int(learning.get("losses", self.black_wins))
+                self.draws = int(learning.get("draws", self.draws))
+                config = dict(payload.get("config") or {})
+                self.teacher_depth = max(1, min(18, int(config.get("teacher_depth", self.teacher_depth))))
+                self.student_depth = max(1, min(3, int(config.get("student_depth", self.student_depth))))
+                self.learning_rate = max(0.0, min(0.5, float(config.get("learning_rate", self.learning_rate))))
+                self.teacher_learning_rate = max(0.0, min(0.5, float(config.get("teacher_learning_rate", self.teacher_learning_rate))))
+                self.guard_min_gap_delta = max(-1000.0, min(1000.0, float(config.get("guard_min_gap_delta", self.guard_min_gap_delta))))
+                self.loaded_checkpoint = {
+                    "path": str(path),
+                    "teacher": payload.get("teacher", ""),
+                    "created_at": payload.get("created_at", ""),
+                    "baseline": payload.get("baseline", {}),
+                    "final": payload.get("final", {}),
+                }
+                self.last_event = f"loaded {path.name}"
+                self.last_error = ""
+                return
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                load_error = f"{path.name}: {type(exc).__name__}: {exc}"
+        if load_error:
+            self.last_error = f"Checkpoint load failed: {load_error}"
 
     def close(self) -> None:
         with self.lock:
@@ -705,6 +841,7 @@ class Trainer:
         self.reward = 0.0
         self.moves = []
         self.episode_trace = []
+        self._save_checkpoint_locked()
 
     def step_once(self) -> None:
         with self.step_lock:
@@ -737,12 +874,15 @@ class Trainer:
             with self.lock:
                 if not accepted:
                     self._restore_state_locked(before_state)
+                else:
+                    self._save_fallback_best_checkpoint_locked(guard)
                 self.last_guard = guard
                 self.last_event = (
                     f"guard accepted {baseline['avg_gap']:.1f}->{candidate['avg_gap']:.1f}"
                     if accepted
                     else f"guard rejected {candidate['avg_gap']:.1f}>{baseline['avg_gap']:.1f}"
                 )
+                self._save_checkpoint_locked()
             return guard
 
     def _step_once(self) -> None:
@@ -851,6 +991,7 @@ class Trainer:
                     if key in weights:
                         self.weights[key] = max(-2.0, min(3.0, float(weights[key])))
             self.last_event = "settings updated"
+            self._save_checkpoint_locked()
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -913,6 +1054,11 @@ class Trainer:
                     "teacher_learning_rate": self.teacher_learning_rate,
                     "guard_enabled": self.guard_enabled,
                     "guard_min_gap_delta": self.guard_min_gap_delta,
+                },
+                "checkpoint": {
+                    "current": str(self.checkpoint_path),
+                    "best": str(self.best_checkpoint_path),
+                    "loaded": dict(self.loaded_checkpoint),
                 },
                 "last_event": self.last_event,
                 "last_error": self.last_error,

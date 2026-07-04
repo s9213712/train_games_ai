@@ -11,6 +11,18 @@ Unified workspace for four game AI training dashboards:
 
 Each subproject keeps its own README and runtime instructions.
 
+## Runtime Model Audit
+
+After local training, run:
+
+```bash
+python3 scripts/audit_usable_models.py
+```
+
+The audit checks the ignored `runtime/` artifacts for all four games, verifies
+that Chess loads its best checkpoint, evaluates Snake/Soccer/Tetris with fixed
+seeds, and writes `runtime/usable_model_audit_latest.json`.
+
 ## Repository Notes
 
 This repository tracks source code, dashboards, scripts, docs, and small static
