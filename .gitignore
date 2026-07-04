@@ -1,0 +1,60 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+*~
+.idea/
+.vscode/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+
+# Python environments and packaging output
+.Python
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# JavaScript dependencies, if a dashboard adds a build step later
+node_modules/
+
+# Local secrets and machine-specific config
+.env
+.env.*
+!.env.example
+
+# Runtime and training output
+logs/
+runtime/
+*.log
+*.out
+*.pid
+events.out.tfevents*
+
+# Model checkpoints and generated bundles
+*.zip
+*.snakeai.zip
+trained_models*/
+original_models/
+protected_models/
+archives/
+
+# Misc generated files
+*.sqlite
+*.sqlite3
+db.sqlite3
+db.sqlite3-journal

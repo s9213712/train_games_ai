@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chess AI Trainer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="stage">
+        <header class="topbar">
+          <div>
+            <h1>Chess AI Trainer</h1>
+            <div class="status-line">
+              <span id="runState">idle</span>
+              <span id="eventText">ready</span>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="startBtn" class="primary">Start</button>
+            <button id="pauseBtn">Pause</button>
+            <button id="resetBtn">Reset</button>
+          </div>
+        </header>
+
+        <div class="main-grid">
+          <section class="board-panel">
+            <canvas id="board" width="640" height="640"></canvas>
+            <div class="hud">
+              <div><span>Game</span><strong id="game">0</strong></div>
+              <div><span>Ply</span><strong id="ply">0</strong></div>
+              <div><span>Turn</span><strong id="turn">white</strong></div>
+              <div><span>Reward</span><strong id="reward">0</strong></div>
+              <div><span>Best</span><strong id="best">0</strong></div>
+              <div><span>Teacher</span><strong id="teacherState">offline</strong></div>
+              <div><span>Win Rate</span><strong id="winRate">0%</strong></div>
+              <div><span>Match</span><strong id="matchRate">0%</strong></div>
+              <div><span>Samples</span><strong id="samples">0</strong></div>
+              <div><span>TD Error</span><strong id="trainLoss">0</strong></div>
+              <div><span>Strength</span><strong id="strength">800</strong></div>
+              <div><span>Updates</span><strong id="updates">0</strong></div>
+            </div>
+          </section>
+
+          <section class="analysis-panel">
+            <div class="section-title">Teacher Lines</div>
+            <div id="lines" class="lines"></div>
+            <div class="section-title">Recent Moves</div>
+            <div id="moves" class="moves"></div>
+            <div class="section-title">Training History</div>
+            <canvas id="chart" width="520" height="180"></canvas>
+            <div id="weights" class="weights"></div>
+          </section>
+        </div>
+      </section>
+
+      <aside class="controls">
+        <div class="section-title">Training</div>
+        <label>Teacher Depth <input id="teacherDepth" type="number" min="1" max="18" step="1" /></label>
+        <label>Chunk Moves <input id="chunkMoves" type="number" min="1" max="30" step="1" /></label>
+        <label>Learning Rate <input id="learningRate" type="number" min="0" max="0.5" step="0.005" /></label>
+        <label>Exploration <input id="exploration" type="range" min="0" max="80" value="8" /></label>
+        <label>Mutation <input id="mutation" type="range" min="0" max="100" value="12" /></label>
+        <div class="grid-two">
+          <button id="stepBtn">Step</button>
+          <button id="burstBtn">Burst</button>
+        </div>
+
+        <div class="section-title">Student Weights</div>
+        <label>Material <input id="wMaterial" type="number" step="0.05" /></label>
+        <label>Mobility <input id="wMobility" type="number" step="0.05" /></label>
+        <label>Center <input id="wCenter" type="number" step="0.05" /></label>
+        <label>King Safety <input id="wKing" type="number" step="0.05" /></label>
+        <button id="applyBtn" class="primary">Apply</button>
+        <div id="stockfishBox" class="stockfish"></div>
+        <div id="errorBox" class="error" hidden></div>
+      </aside>
+    </main>
+    <script src="/app.js?v=20260703-learning"></script>
+  </body>
+</html>

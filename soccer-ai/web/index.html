@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Soccer AI Trainer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="stage">
+        <header class="topbar">
+          <div>
+            <h1>Soccer AI Trainer</h1>
+            <div class="status-line">
+              <span id="runState">idle</span>
+              <span id="eventText">ready</span>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="startBtn" class="primary">Start</button>
+            <button id="pauseBtn">Pause</button>
+            <button id="resetBtn">Reset</button>
+          </div>
+        </header>
+
+        <section class="pitch-panel">
+          <canvas id="pitch" width="900" height="540"></canvas>
+          <div class="hud">
+            <div><span>Match</span><strong id="match">0</strong></div>
+            <div><span>Clock</span><strong id="clock">0.0</strong></div>
+            <div><span>Blue</span><strong id="blueScore">0</strong></div>
+            <div><span>Red</span><strong id="redScore">0</strong></div>
+            <div><span>Reward</span><strong id="reward">0</strong></div>
+            <div><span>Best</span><strong id="best">0</strong></div>
+            <div><span>Win Rate</span><strong id="winRate">0%</strong></div>
+            <div><span>Record</span><strong id="record">0-0-0</strong></div>
+            <div><span>Shots</span><strong id="shots">0</strong></div>
+            <div><span>Possession</span><strong id="possession">0%</strong></div>
+            <div><span>Fouls</span><strong id="fouls">0-0</strong></div>
+            <div><span>Cards</span><strong id="cards">0Y 0R</strong></div>
+            <div><span>Stamina</span><strong id="stamina">100%</strong></div>
+            <div><span>Advantage</span><strong id="advantage">off</strong></div>
+            <div><span>Restart</span><strong id="restart">open</strong></div>
+            <div><span>Rules</span><strong id="rules">11v11</strong></div>
+          </div>
+        </section>
+
+        <section class="analysis-panel">
+          <div class="section-title">Training History</div>
+          <canvas id="chart" width="900" height="190"></canvas>
+          <div id="weights" class="weights"></div>
+        </section>
+      </section>
+
+      <aside class="controls">
+        <div class="section-title">Training</div>
+        <label>Speed <input id="speed" type="range" min="1" max="80" value="10" /></label>
+        <label>Exploration <input id="epsilon" type="range" min="0" max="60" value="20" /></label>
+        <label>Mutation <input id="mutation" type="range" min="1" max="80" value="20" /></label>
+        <label>Match Seconds <input id="matchSeconds" type="number" min="10" max="180" step="5" value="45" /></label>
+        <div class="grid-two">
+          <button id="stepBtn">Step</button>
+          <button id="burstBtn">Burst</button>
+        </div>
+
+        <div class="section-title">Policy</div>
+        <label>Chase <input id="wChase" type="number" step="0.1" /></label>
+        <label>Goal Bias <input id="wGoal" type="number" step="0.1" /></label>
+        <label>Spacing <input id="wSpacing" type="number" step="0.1" /></label>
+        <label>Press <input id="wPress" type="number" step="0.1" /></label>
+        <label>Shoot <input id="wShoot" type="number" step="0.1" /></label>
+        <button id="applyWeightsBtn" class="primary">Apply Weights</button>
+        <div class="section-title">Backend RL</div>
+        <div class="grid-two">
+          <button id="rlStartBtn" class="primary">RL Start</button>
+          <button id="rlPauseBtn">RL Pause</button>
+        </div>
+        <div class="grid-two">
+          <button id="rlStepBtn">10 Episodes</button>
+          <button id="rlResetBtn">RL Reset</button>
+        </div>
+        <label>RL Rate <input id="rlRate" type="number" min="0.0005" max="0.08" step="0.001" value="0.012" /></label>
+        <label>Self Play <input id="rlSelfPlay" type="checkbox" /></label>
+        <label>League <input id="rlLeague" type="checkbox" checked /></label>
+        <div class="grid-two">
+          <button id="rlReplayBtn">Load Replay</button>
+          <button id="rlReplayPlayBtn">Replay Play</button>
+        </div>
+        <div class="grid-two">
+          <button id="rlReplayPrevBtn">Prev Frame</button>
+          <button id="rlReplayNextBtn">Next Frame</button>
+        </div>
+        <label>Replay Frame <input id="rlReplaySlider" type="range" min="0" max="0" value="0" /></label>
+        <div class="grid-two">
+          <button id="rlEvalBtn">Evaluate</button>
+          <select id="rlEvalOpponent">
+            <option value="mixed">Mixed</option>
+            <option value="scripted">Scripted</option>
+            <option value="current_red">Current Red</option>
+            <option value="league">League</option>
+          </select>
+        </div>
+        <div id="rlBox" class="rl-box"></div>
+        <div id="errorBox" class="error" hidden></div>
+      </aside>
+    </main>
+  <script src="/app.js?v=20260704-replay-eval"></script>
+</body>
+</html>

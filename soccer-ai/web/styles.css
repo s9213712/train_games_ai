@@ -1,0 +1,240 @@
+:root {
+  color-scheme: dark;
+  --bg: #101315;
+  --panel: #191d21;
+  --panel-2: #242a31;
+  --line: #3b444f;
+  --text: #eef4f7;
+  --muted: #9faab4;
+  --accent: #2677bd;
+  --accent-2: #d08d2d;
+  --blue: #38a3ff;
+  --red: #f45b69;
+  --green: #2f8a55;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: minmax(760px, 1120px) 330px;
+  gap: 16px;
+  align-items: start;
+  justify-content: center;
+  padding: 16px;
+  min-height: 100vh;
+}
+
+.stage,
+.controls {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.stage {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: 0;
+}
+
+.status-line,
+.actions,
+.grid-two {
+  display: flex;
+  gap: 8px;
+}
+
+.status-line {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+button,
+input,
+select {
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+}
+
+button {
+  padding: 0 14px;
+  cursor: pointer;
+}
+
+button.primary {
+  background: #1e5f93;
+  border-color: #2878b7;
+}
+
+button:hover {
+  border-color: var(--accent-2);
+}
+
+.pitch-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 170px;
+  gap: 12px;
+  align-items: start;
+}
+
+#pitch,
+#chart {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0b2417;
+}
+
+#pitch {
+  aspect-ratio: 5 / 3;
+}
+
+.hud {
+  display: grid;
+  gap: 8px;
+}
+
+.hud div,
+.weights div,
+.rl-box {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.hud span,
+.weights span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.hud strong {
+  font-size: 17px;
+}
+
+.analysis-panel,
+.controls {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.section-title {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.weights {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.controls {
+  padding: 14px;
+  width: 330px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+input[type="number"] {
+  width: 100%;
+  padding: 0 10px;
+}
+
+select {
+  width: 100%;
+  padding: 0 10px;
+}
+
+input[type="range"] {
+  width: 100%;
+}
+
+.grid-two {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.error {
+  border: 1px solid var(--red);
+  border-radius: 6px;
+  color: #ffd3d7;
+  padding: 10px;
+  background: #37171e;
+}
+
+.rl-box {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.rl-box strong {
+  color: var(--text);
+  font-weight: 700;
+}
+
+input[type="checkbox"] {
+  justify-self: start;
+  min-height: auto;
+  width: 18px;
+  height: 18px;
+}
+
+@media (max-width: 1120px) {
+  .app-shell,
+  .pitch-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .controls {
+    width: 100%;
+  }
+
+  .hud {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}

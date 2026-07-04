@@ -1,0 +1,24 @@
+[project]
+name = "snake-ai"
+version = "0.2.0"
+description = "Snake game environments and MaskablePPO training scripts."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "gymnasium==1.3.0",
+    "stable-baselines3==2.9.0",
+    "sb3-contrib==2.9.0",
+    "pygame-ce==2.5.6",
+    "tensorboard>=2.9.1",
+    "flask>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

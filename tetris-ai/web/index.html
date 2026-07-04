@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tetris AI Trainer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="stage">
+        <header class="topbar">
+          <div>
+            <h1>Tetris AI Trainer</h1>
+            <div class="status-line">
+              <span id="runState">idle</span>
+              <span id="eventText">ready</span>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="startBtn" class="primary">Start</button>
+            <button id="pauseBtn">Pause</button>
+            <button id="resetBtn">Reset</button>
+          </div>
+        </header>
+
+        <div class="stage-grid">
+          <section class="board-panel">
+            <canvas id="board" width="360" height="720"></canvas>
+            <aside class="side-panel">
+              <div class="section-title">Next</div>
+              <canvas id="nextPiece" width="132" height="132"></canvas>
+              <div class="metrics">
+                <div><span>Episode</span><strong id="episode">0</strong></div>
+                <div><span>Pieces</span><strong id="pieces">0</strong></div>
+                <div><span>Lines</span><strong id="lines">0</strong></div>
+                <div><span>Score</span><strong id="score">0</strong></div>
+                <div><span>Reward</span><strong id="reward">0</strong></div>
+                <div><span>Best</span><strong id="bestReward">0</strong></div>
+              </div>
+            </aside>
+          </section>
+
+          <section class="analysis-panel">
+            <div class="section-title">Training History</div>
+            <canvas id="chart" width="680" height="210"></canvas>
+            <div class="weights" id="weights"></div>
+          </section>
+        </div>
+      </section>
+
+      <aside class="controls">
+        <div class="section-title">Training</div>
+        <label>Speed <input id="speed" type="range" min="1" max="120" value="18" /></label>
+        <label>Exploration <input id="epsilon" type="range" min="0" max="60" value="18" /></label>
+        <label>Mutation <input id="mutation" type="range" min="1" max="80" value="22" /></label>
+        <label>Preview FPS <input id="fps" type="range" min="2" max="30" value="12" /></label>
+        <div class="grid-two">
+          <button id="stepBtn">Step</button>
+          <button id="fastBtn">Burst</button>
+        </div>
+
+        <div class="section-title">Policy</div>
+        <label>Lines <input id="wLines" type="number" step="0.1" /></label>
+        <label>Height <input id="wHeight" type="number" step="0.1" /></label>
+        <label>Holes <input id="wHoles" type="number" step="0.1" /></label>
+        <label>Bumpiness <input id="wBumpiness" type="number" step="0.1" /></label>
+        <label>Wells <input id="wWells" type="number" step="0.1" /></label>
+        <button id="applyWeightsBtn" class="primary">Apply Weights</button>
+        <div class="section-title">Backend RL</div>
+        <div class="grid-two">
+          <button id="rlStartBtn" class="primary">RL Start</button>
+          <button id="rlPauseBtn">RL Pause</button>
+        </div>
+        <div class="grid-two">
+          <button id="rlStepBtn">Guarded 10</button>
+          <button id="rlResetBtn">RL Reset</button>
+        </div>
+        <label>TD Rate <input id="rlRate" type="number" min="0.0001" max="0.2" step="0.0001" value="0.0005" /></label>
+        <label>Epsilon <input id="rlEpsilon" type="number" min="0" max="0.5" step="0.005" value="0.015" /></label>
+        <label>Lookahead <input id="rlLookahead" type="number" min="0" max="0.95" step="0.05" value="0.10" /></label>
+        <label>Future Hold <input id="rlFutureHold" type="checkbox" /></label>
+        <div class="grid-two">
+          <button id="rlReplayBtn">Load Replay</button>
+          <button id="rlReplayPlayBtn">Replay Play</button>
+        </div>
+        <div class="grid-two">
+          <button id="rlReplayPrevBtn">Prev Frame</button>
+          <button id="rlReplayNextBtn">Next Frame</button>
+        </div>
+        <label>Replay Frame <input id="rlReplaySlider" type="range" min="0" max="0" value="0" /></label>
+        <div class="grid-two">
+          <button id="rlEvalBtn">Evaluate</button>
+          <button id="rlStrongEvalBtn">Strong Eval</button>
+        </div>
+        <div id="rlBox" class="rl-box"></div>
+        <div id="errorBox" class="error" hidden></div>
+      </aside>
+    </main>
+    <script src="/app.js?v=20260704-strong-eval"></script>
+  </body>
+</html>
