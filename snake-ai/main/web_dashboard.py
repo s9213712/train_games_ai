@@ -32,6 +32,14 @@ WEB_DIR = ROOT_DIR / "web"
 MAIN_DIR = ROOT_DIR / "main"
 ORIGINAL_MODEL_DIR = MAIN_DIR / "original_models"
 FULLBOARD_CNN_MODEL = MAIN_DIR / "trained_models_cnn_oracle_bc" / "ppo_snake_bc_final_12x12.zip"
+MAX_MODEL_UPLOAD_BYTES = int(os.environ.get("SNAKE_MAX_MODEL_UPLOAD_BYTES", str(128 * 1024 * 1024)))
+MODEL_UPLOAD_ENABLED = os.environ.get("SNAKE_ENABLE_MODEL_UPLOAD", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+THREAD_JOIN_TIMEOUT_SECONDS = float(os.environ.get("SNAKE_THREAD_JOIN_TIMEOUT_SECONDS", "5"))
 
 
 DEFAULT_CONFIG = {
@@ -107,6 +115,23 @@ class TrainingDashboard:
         self.last_error = None
         self.last_event = "idle"
 
+    def _stop_active_thread(self):
+        with self.lock:
+            self.running = False
+            self.stop_requested = True
+            active_thread = self.thread
+        if active_thread is not None and active_thread.is_alive():
+            active_thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
+            if active_thread.is_alive():
+                with self.lock:
+                    self.stop_requested = False
+                    self.last_event = "waiting for training chunk to finish"
+                    self.last_error = (
+                        "Training is still finishing its current chunk. "
+                        "Pause and retry after the current chunk completes."
+                    )
+                raise RuntimeError(self.last_error)
+
     def snapshot(self):
         with self.lock:
             return {
@@ -148,12 +173,7 @@ class TrainingDashboard:
             self.last_event = "paused"
 
     def reset(self, updates=None):
-        with self.lock:
-            self.running = False
-            self.stop_requested = True
-            active_thread = self.thread
-        if active_thread is not None and active_thread.is_alive():
-            active_thread.join()
+        self._stop_active_thread()
 
         with self.lock:
             if updates:
@@ -212,15 +232,28 @@ class TrainingDashboard:
         return payload, filename
 
     def import_model_bundle(self, uploaded_file):
+        if not MODEL_UPLOAD_ENABLED:
+            raise PermissionError(
+                "Model upload is disabled. Set SNAKE_ENABLE_MODEL_UPLOAD=1 only for trusted local use."
+            )
         with tempfile.TemporaryDirectory() as tmpdir:
             upload_path = Path(tmpdir) / "upload.zip"
             uploaded_file.save(upload_path)
+            if upload_path.stat().st_size > MAX_MODEL_UPLOAD_BYTES:
+                raise ValueError("Uploaded model bundle is too large.")
             model_path = Path(tmpdir) / "model.zip"
             metadata = {}
 
             with zipfile.ZipFile(upload_path) as uploaded_zip:
                 names = set(uploaded_zip.namelist())
                 if {"model.zip", "metadata.json"}.issubset(names):
+                    model_info = uploaded_zip.getinfo("model.zip")
+                    metadata_info = uploaded_zip.getinfo("metadata.json")
+                    if (
+                        model_info.file_size > MAX_MODEL_UPLOAD_BYTES
+                        or metadata_info.file_size > 1024 * 1024
+                    ):
+                        raise ValueError("Uploaded model bundle contents are too large.")
                     uploaded_zip.extract("model.zip", tmpdir)
                     metadata = json.loads(uploaded_zip.read("metadata.json").decode("utf-8"))
                 else:
@@ -234,11 +267,7 @@ class TrainingDashboard:
         with self.lock:
             if self.model is None:
                 raise ValueError("No model has been created yet.")
-            self.running = False
-            self.stop_requested = True
-            active_thread = self.thread
-        if active_thread is not None and active_thread.is_alive():
-            active_thread.join()
+        self._stop_active_thread()
 
         with self.model_io_lock:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -267,12 +296,7 @@ class TrainingDashboard:
         return self.snapshot()
 
     def _replace_model_from_file(self, model_path, metadata):
-        with self.lock:
-            self.running = False
-            self.stop_requested = True
-            active_thread = self.thread
-        if active_thread is not None and active_thread.is_alive():
-            active_thread.join()
+        self._stop_active_thread()
 
         with self.model_io_lock:
             with self.lock:
@@ -780,6 +804,10 @@ dashboard = TrainingDashboard()
 app = Flask(__name__, static_folder=str(WEB_DIR), static_url_path="")
 
 
+def json_error(message, status=400):
+    return jsonify({"ok": False, "error": str(message)}), status
+
+
 @app.get("/")
 def index():
     return send_from_directory(WEB_DIR, "index.html")
@@ -804,13 +832,21 @@ def pause():
 
 @app.post("/api/reset")
 def reset():
-    dashboard.reset(request.get_json(silent=True) or {})
+    try:
+        dashboard.reset(request.get_json(silent=True) or {})
+    except RuntimeError as exc:
+        return json_error(exc, 409)
+    except (TypeError, ValueError) as exc:
+        return json_error(exc, 400)
     return jsonify({"ok": True, **dashboard.snapshot()})
 
 
 @app.post("/api/settings")
 def settings():
-    config = dashboard.update_config(request.get_json(silent=True) or {})
+    try:
+        config = dashboard.update_config(request.get_json(silent=True) or {})
+    except (TypeError, ValueError) as exc:
+        return json_error(exc, 400)
     return jsonify({"ok": True, "config": config})
 
 
@@ -830,12 +866,23 @@ def download_model():
 
 @app.post("/api/model/upload")
 def upload_model():
+    if not MODEL_UPLOAD_ENABLED:
+        return json_error(
+            "Model upload is disabled. Set SNAKE_ENABLE_MODEL_UPLOAD=1 only for trusted local use.",
+            403,
+        )
+    if request.content_length and request.content_length > MAX_MODEL_UPLOAD_BYTES:
+        return json_error("Uploaded model bundle is too large.", 413)
     uploaded_file = request.files.get("model")
     if uploaded_file is None or not uploaded_file.filename:
         return jsonify({"ok": False, "error": "Upload a .snakeai.zip or Stable-Baselines3 .zip model file."}), 400
     try:
         snapshot = dashboard.import_model_bundle(uploaded_file)
-    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, KeyError) as exc:
+    except PermissionError as exc:
+        return json_error(exc, 403)
+    except RuntimeError as exc:
+        return json_error(exc, 409)
+    except (OSError, ValueError, zipfile.BadZipFile, KeyError) as exc:
         return jsonify({"ok": False, "error": f"Could not import model: {exc}"}), 400
     return jsonify({"ok": True, **snapshot})
 
@@ -845,12 +892,14 @@ def move_model_device():
     payload = request.get_json(silent=True) or {}
     try:
         snapshot = dashboard.move_to_device(payload.get("device", dashboard.config["device"]))
-    except (OSError, ValueError, RuntimeError) as exc:
+    except RuntimeError as exc:
+        return json_error(exc, 409)
+    except (OSError, ValueError) as exc:
         return jsonify({"ok": False, "error": f"Could not move model device: {exc}"}), 400
     return jsonify({"ok": True, **snapshot})
 
 
 if __name__ == "__main__":
-    host = os.environ.get("SNAKE_DASHBOARD_HOST", "0.0.0.0")
+    host = os.environ.get("SNAKE_DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("SNAKE_DASHBOARD_PORT", "7860"))
     app.run(host=host, port=port, threaded=True)

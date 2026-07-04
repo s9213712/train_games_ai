@@ -105,6 +105,7 @@ class RLTrainer:
         self.policy = SoftmaxPolicy(len(obs), len(ACTION_NAMES))
         self.red_policy = SoftmaxPolicy(len(obs), len(ACTION_NAMES), seed=13)
         self.lock = threading.RLock()
+        self.training_lock = threading.RLock()
         self.running = False
         self.stop_requested = False
         self.thread: threading.Thread | None = None
@@ -127,6 +128,10 @@ class RLTrainer:
         self._load_checkpoint()
 
     def train_episode(self) -> dict:
+        with self.training_lock:
+            return self._train_episode()
+
+    def _train_episode(self) -> dict:
         with self.lock:
             episode_index = self.episode
             self.episode += 1
@@ -205,6 +210,10 @@ class RLTrainer:
             self.last_event = "paused"
 
     def reset(self) -> None:
+        with self.training_lock:
+            self._reset()
+
+    def _reset(self) -> None:
         with self.lock:
             self.policy = SoftmaxPolicy(self.policy.obs_dim, self.policy.action_dim)
             self.red_policy = SoftmaxPolicy(self.red_policy.obs_dim, self.red_policy.action_dim, seed=13)
@@ -277,6 +286,10 @@ class RLTrainer:
             return {"frames": list(self.latest_replay), "latest": dict(self.latest_info)}
 
     def evaluate(self, episodes: int = 20, opponent: str = "mixed") -> dict:
+        with self.training_lock:
+            return self._evaluate(episodes, opponent)
+
+    def _evaluate(self, episodes: int = 20, opponent: str = "mixed") -> dict:
         episodes = max(1, min(200, int(episodes)))
         opponent = opponent if opponent in {"mixed", "scripted", "current_red", "league"} else "mixed"
         with self.lock:

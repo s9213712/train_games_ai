@@ -205,6 +205,7 @@ class RLTrainer:
         self.replay_path = self.runtime / "latest_replay.json"
         self.eval_path = self.runtime / "latest_evaluation.json"
         self.lock = threading.RLock()
+        self.training_lock = threading.RLock()
         self.running = False
         self.stop_requested = False
         self.thread: threading.Thread | None = None
@@ -229,6 +230,10 @@ class RLTrainer:
         self._load_checkpoint()
 
     def train_episode(self, *, persist: bool = True) -> dict:
+        with self.training_lock:
+            return self._train_episode(persist=persist)
+
+    def _train_episode(self, *, persist: bool = True) -> dict:
         with self.lock:
             episode = self.episode
             self.episode += 1
@@ -312,6 +317,10 @@ class RLTrainer:
         return final
 
     def evaluate(self, episodes: int = 20, *, lookahead_include_hold: bool | None = None) -> dict:
+        with self.training_lock:
+            return self._evaluate(episodes, lookahead_include_hold=lookahead_include_hold)
+
+    def _evaluate(self, episodes: int = 20, *, lookahead_include_hold: bool | None = None) -> dict:
         episodes = max(1, min(200, int(episodes)))
         with self.lock:
             policy = self.policy.clone()
@@ -332,6 +341,14 @@ class RLTrainer:
         return evaluation
 
     def train_guarded_batch(self, episodes: int, *, eval_episodes: int = 4, accept_ratio: float = 0.98) -> dict:
+        with self.training_lock:
+            return self._train_guarded_batch(
+                episodes,
+                eval_episodes=eval_episodes,
+                accept_ratio=accept_ratio,
+            )
+
+    def _train_guarded_batch(self, episodes: int, *, eval_episodes: int = 4, accept_ratio: float = 0.98) -> dict:
         episodes = max(1, min(500, int(episodes)))
         eval_episodes = max(2, min(24, int(eval_episodes)))
         accept_ratio = max(0.7, min(1.1, float(accept_ratio)))
@@ -489,6 +506,10 @@ class RLTrainer:
             self.last_event = "paused"
 
     def reset(self) -> None:
+        with self.training_lock:
+            self._reset()
+
+    def _reset(self) -> None:
         with self.lock:
             self.policy = AfterstateValue(self.policy.dim)
             self.target_policy = self.policy.clone()

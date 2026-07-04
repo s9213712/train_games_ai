@@ -413,6 +413,7 @@ def stockfish_teacher(path: str, board: chess.Board, depth: int) -> dict:
 class Trainer:
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self.step_lock = threading.RLock()
         self.running = False
         self.thread: threading.Thread | None = None
         self.stop_requested = False
@@ -594,6 +595,10 @@ class Trainer:
         self.episode_trace = []
 
     def step_once(self) -> None:
+        with self.step_lock:
+            self._step_once()
+
+    def _step_once(self) -> None:
         with self.lock:
             if self.board.is_game_over(claim_draw=True) or self.ply >= 160:
                 self.finish_game()
@@ -762,6 +767,10 @@ trainer = Trainer()
 app = Flask(__name__, static_folder=str(WEB_DIR))
 
 
+def json_error(message, status=400):
+    return jsonify({"ok": False, "error": str(message)}), status
+
+
 @app.route("/")
 def index():
     return send_from_directory(WEB_DIR, "index.html")
@@ -798,7 +807,10 @@ def api_reset():
 
 @app.post("/api/step")
 def api_step():
-    count = int((request.get_json(silent=True) or {}).get("count", 1))
+    try:
+        count = int((request.get_json(silent=True) or {}).get("count", 1))
+    except (TypeError, ValueError) as exc:
+        return json_error(exc, 400)
     for _ in range(max(1, min(500, count))):
         trainer.step_once()
     return jsonify(trainer.snapshot())
@@ -806,7 +818,10 @@ def api_step():
 
 @app.post("/api/config")
 def api_config():
-    trainer.update_config(request.get_json(silent=True) or {})
+    try:
+        trainer.update_config(request.get_json(silent=True) or {})
+    except (TypeError, ValueError) as exc:
+        return json_error(exc, 400)
     return jsonify(trainer.snapshot())
 
 
