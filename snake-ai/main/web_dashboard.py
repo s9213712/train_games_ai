@@ -524,6 +524,22 @@ class TrainingDashboard:
             return 3
         raise ValueError(f"Invalid Hamiltonian edge: {head} -> {next_position}")
 
+    def _initial_model_path(self, device):
+        profile = self.config["model_profile"]
+        if profile in {"new", "custom"}:
+            return None
+        if profile == "fullboard_12x12":
+            if self.config["agent"] == "cnn" and self._uses_default_cnn_architecture() and FULLBOARD_CNN_MODEL.exists():
+                return FULLBOARD_CNN_MODEL
+            return None
+        if profile == "repo_original":
+            if self.config["agent"] == "cnn" and not self._uses_default_cnn_architecture():
+                return None
+            if self.config["agent"] == "mlp" and int(self.config["board_size"]) != 12:
+                return None
+            return default_original_model_path(self.config["agent"], device)
+        return None
+
     def _make_train_env(self):
         env_cls = self._env_class()
         base_seed = self.config["seed"]
@@ -531,21 +547,23 @@ class TrainingDashboard:
 
         def _init(rank):
             seed = base_seed + rank * 1009
-            env = env_cls(
-                seed=seed,
-                board_size=board_size,
-                silent_mode=True,
-                limit_step=True,
-                food_time_penalty=self.config["food_time_penalty"],
-                food_step_limit_multiplier=self.config["food_step_limit_multiplier"],
-                food_reward_bonus=self.config["food_reward_bonus"],
-                distance_reward_scale=self.config["distance_reward_scale"],
-                loop_penalty=self.config["loop_penalty"],
-                loop_window=self.config["loop_window"],
-                oscillation_penalty=self.config["oscillation_penalty"],
-                oscillation_window=self.config["oscillation_window"],
-                channel_first=self.config["cnn_channel_first"] if env_cls is SnakeCnnEnv else False,
-            )
+            env_kwargs = {
+                "seed": seed,
+                "board_size": board_size,
+                "silent_mode": True,
+                "limit_step": True,
+                "food_time_penalty": self.config["food_time_penalty"],
+                "food_step_limit_multiplier": self.config["food_step_limit_multiplier"],
+                "food_reward_bonus": self.config["food_reward_bonus"],
+                "distance_reward_scale": self.config["distance_reward_scale"],
+                "loop_penalty": self.config["loop_penalty"],
+                "loop_window": self.config["loop_window"],
+                "oscillation_penalty": self.config["oscillation_penalty"],
+                "oscillation_window": self.config["oscillation_window"],
+            }
+            if env_cls is SnakeCnnEnv:
+                env_kwargs["channel_first"] = self.config["cnn_channel_first"]
+            env = env_cls(**env_kwargs)
             env = Monitor(env)
             env = ActionMasker(env, lambda wrapped_env: wrapped_env.unwrapped.get_action_mask())
             env.reset(seed=seed)
@@ -562,11 +580,7 @@ class TrainingDashboard:
         torch.manual_seed(seed)
         self.train_env = self._make_train_env()
         device = select_device(self.config["device"])
-        original_model_path = (
-            default_original_model_path(self.config["agent"], device)
-            if self._uses_default_cnn_architecture() or self.config["agent"] == "mlp"
-            else None
-        )
+        original_model_path = self._initial_model_path(device)
         if original_model_path is not None:
             self.model = self._load_model(original_model_path, self.train_env, device)
             if self.trained_steps == 0:
