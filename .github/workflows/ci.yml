@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-validation:
+    name: Cross-project static validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up minimum Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Compile Python sources
+        run: python -m compileall -q chess-ai snake-ai soccer-ai tetris-ai scripts
+
+      - name: Check shell syntax
+        run: >-
+          python -c "import pathlib, subprocess;
+          files = sorted(pathlib.Path('.').glob('**/*.sh'));
+          assert files, 'no shell scripts found';
+          [subprocess.run(['bash', '-n', str(path)], check=True) for path in files];
+          print(f'checked {len(files)} shell files')"
+
+      - name: Check dashboard JavaScript syntax
+        run: >-
+          python -c "import pathlib, subprocess;
+          files = sorted(pathlib.Path('.').glob('**/web/*.js'));
+          assert files, 'no dashboard JavaScript found';
+          [subprocess.run(['node', '--check', str(path)], check=True) for path in files];
+          print(f'checked {len(files)} JavaScript files')"
