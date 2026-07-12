@@ -18,7 +18,7 @@
             </div>
           </div>
           <div class="actions">
-            <button id="startBtn" class="primary">Start</button>
+            <button id="startBtn" class="primary">Start PPO Training</button>
             <button id="pauseBtn">Pause</button>
             <button id="resetBtn">Reset</button>
           </div>
@@ -37,7 +37,7 @@
             <div class="actions wide">
               <button id="importModelBtn">Import And Pause</button>
             </div>
-            <p id="modelStatus" class="hint">Downloaded bundles can be imported later to continue training.</p>
+            <p id="modelStatus" class="hint">Trusted imports load as unverified baselines; prior guard provenance is cleared.</p>
 
             <div class="grid-two">
               <label>
@@ -54,6 +54,7 @@
                   <option value="hamiltonian">Hamiltonian oracle</option>
                 </select>
               </label>
+              <p class="hint strategy-hint">Strategy changes canvas preview only. PPO guard evaluation always measures the model policy.</p>
               <label>
                 Device
                 <select id="device">
@@ -102,8 +103,8 @@
             <div class="board-wrap">
               <canvas id="board" width="720" height="720"></canvas>
               <div class="hud">
-                <div><span>Steps</span><strong id="trainedSteps">0</strong></div>
-                <div><span>Best Score</span><strong id="bestScore">0</strong></div>
+                <div><span>Accepted PPO Steps</span><strong id="trainedSteps">0</strong></div>
+                <div><span>Best Model Preview</span><strong id="bestScore">0</strong></div>
                 <div><span>Best Steps</span><strong id="bestSteps">0</strong></div>
                 <div><span>Score</span><strong id="score">0</strong></div>
                 <div><span>Length</span><strong id="length">3</strong></div>
@@ -117,7 +118,7 @@
             </div>
 
             <section class="chart-section">
-              <div class="section-title">Training History</div>
+              <div class="section-title">Model Preview History (source labelled below)</div>
               <canvas id="chart" width="720" height="160"></canvas>
             </section>
           </section>
@@ -125,6 +126,15 @@
       </section>
 
       <aside class="controls">
+        <div class="section-title">PPO Guard Evidence</div>
+        <div id="guardEvidence" class="guard-evidence">
+          <div>State <strong id="guardState">no guarded candidate yet</strong></div>
+          <div>Development Δ <strong id="guardDevDelta">—</strong></div>
+          <div>Fixed holdout <strong id="guardHoldoutScore">—</strong></div>
+          <div>Holdout Δ <strong id="guardHoldoutDelta">—</strong></div>
+          <div>Holdout seeds <strong id="guardSeeds">—</strong></div>
+          <div>Preview source <strong id="previewSource">model policy</strong></div>
+        </div>
         <div class="section-title">Live Params</div>
         <label>Learning Rate <input id="learningRate" type="number" step="0.00001" min="0.000001" /></label>
         <label>Gamma <input id="gamma" type="number" step="0.01" min="0.1" max="0.999" /></label>
@@ -155,8 +165,9 @@
         </label>
         <label class="check-row">
           <input id="trainingEnabled" type="checkbox" />
-          Train weights
+          Enable real PPO weight training
         </label>
+        <p class="hint">When disabled, the start button runs one preview only and accepted PPO steps remain unchanged.</p>
         <label>
           Playback Speed
           <input id="playbackSpeed" type="range" min="1" max="12" step="1" value="4" />
@@ -178,6 +189,6 @@
         <div id="errorBox" class="error" hidden></div>
       </aside>
     </main>
-    <script src="/app.js?v=20260703-strategy-board"></script>
+    <script src="/app.js?v=20260712-training-integrity"></script>
   </body>
 </html>

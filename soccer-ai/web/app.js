@@ -1047,7 +1047,7 @@ function drawHud() {
     drawReplayHud(backendReplay.frames[backendReplay.index]);
     return;
   }
-  el.runState.textContent = running ? "running" : "paused";
+  el.runState.textContent = running ? "browser demo running" : "browser demo paused";
   el.match.textContent = state.match;
   const limit = Number(el.matchSeconds.value);
   const minute = Math.min(90, Math.floor((state.t / Math.max(1, limit)) * 90));
@@ -1107,8 +1107,8 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
-el.start.addEventListener("click", () => { running = true; setEvent("training"); });
-el.pause.addEventListener("click", () => { running = false; setEvent("paused"); });
+el.start.addEventListener("click", () => { running = true; setEvent("browser mutation demo running"); });
+el.pause.addEventListener("click", () => { running = false; setEvent("browser demo paused"); });
 el.reset.addEventListener("click", () => { running = false; resetAll(); });
 el.step.addEventListener("click", () => { stepSim(); draw(); });
 el.burst.addEventListener("click", () => { for (let i = 0; i < 1500; i += 1) stepSim(); draw(); });
@@ -1123,8 +1123,12 @@ const rl = {
   step: document.getElementById("rlStepBtn"),
   reset: document.getElementById("rlResetBtn"),
   rate: document.getElementById("rlRate"),
+  gamma: document.getElementById("rlGamma"),
+  temperature: document.getElementById("rlTemperature"),
   selfPlay: document.getElementById("rlSelfPlay"),
   league: document.getElementById("rlLeague"),
+  coach: document.getElementById("rlCoach"),
+  coachRate: document.getElementById("rlCoachRate"),
   replay: document.getElementById("rlReplayBtn"),
   replayPlay: document.getElementById("rlReplayPlayBtn"),
   replayPrev: document.getElementById("rlReplayPrevBtn"),
@@ -1273,8 +1277,12 @@ function stepReplay(delta) {
 function rlConfig() {
   return {
     learning_rate: Number(rl.rate.value),
+    gamma: Number(rl.gamma.value),
+    temperature: Number(rl.temperature.value),
     self_play: Boolean(rl.selfPlay.checked),
     league_enabled: Boolean(rl.league?.checked),
+    coach_enabled: Boolean(rl.coach?.checked),
+    coach_rate: Number(rl.coachRate.value),
   };
 }
 
@@ -1291,6 +1299,8 @@ function renderRl(data) {
   const rewards = latest.reward_terms || {};
   const league = data.league || {};
   const guard = data.guard || {};
+  const promotion = guard.promotion || {};
+  const staged = data.staged_candidate || {};
   const evaluation = data.evaluation || {};
   const opponent = latest.opponent || league.last_opponent || {};
   const evalRecord = evaluation.record || {};
@@ -1299,13 +1309,22 @@ function renderRl(data) {
     .map((key) => `${key.replace("_", " ")} ${Number(rewards[key] || 0).toFixed(2)}`)
     .join(" · ");
   const guardText = guard.episodes
-    ? `${guard.accepted ? "accepted" : "rejected"} · ${Number(guard.baseline_objective || 0).toFixed(2)} -> ${Number(guard.candidate_objective || 0).toFixed(2)}`
+    ? `${guard.accepted ? "accepted" : "rejected"} · ${Number(guard.baseline_objective || 0).toFixed(2)} -> ${Number(guard.candidate_objective || 0).toFixed(2)} · actions Δ ${Math.round(Number(guard.behavior?.change_rate || 0) * 1000) / 10}%`
     : "waiting";
+  const promotionText = promotion.evaluated
+    ? `${promotion.promoted ? "best promoted" : "checked"} · ${Number(promotion.baseline_objective || 0).toFixed(2)} -> ${Number(promotion.candidate_objective || 0).toFixed(2)} · fixed context ${promotion.context_id || "-"}`
+    : "not reached";
+  const coachText = data.config?.coach_enabled
+    ? `state-based auxiliary @ ${Number(data.config.coach_effective_rate || 0).toFixed(5)}`
+    : "off (pure RL)";
   rl.box.innerHTML = [
-    `<div>Mode <strong>${data.running ? "training" : "paused"}</strong> · Episode <strong>${data.episode || 0}</strong></div>`,
+    `<div>Backend mode <strong>${data.guard_in_progress ? "validating private candidate; serving accepted" : data.running ? "training" : "paused"}</strong> · Accepted episode <strong>${data.episode || 0}</strong> · Rollout <strong>${data.rollout || 0}</strong></div>`,
     `<div>Record <strong>${record.wins || 0}-${record.losses || 0}-${record.draws || 0}</strong> · Win <strong>${Math.round((record.win_rate || 0) * 100)}%</strong></div>`,
     `<div>League Elo <strong>${Math.round(league.elo || 1000)}</strong> · Pool <strong>${league.pool_size || 0}</strong> · Opp <strong>${opponent.name || "-"}</strong></div>`,
     `<div>Guard <strong>${guardText}</strong></div>`,
+    `<div>Canonical holdout <strong>${promotionText}</strong></div>`,
+    `<div>Private staging <strong>${staged.active ? `${staged.batches || 0} batch(es), not served` : "none"}</strong></div>`,
+    `<div>Coach <strong>${coachText}</strong></div>`,
     `<div>Eval <strong>${evalRecord.wins || 0}-${evalRecord.losses || 0}-${evalRecord.draws || 0}</strong> · GD <strong>${Number(evaluation.avg_goal_diff || 0).toFixed(2)}</strong> · xGD <strong>${Number(evaluation.avg_xg_diff || 0).toFixed(2)}</strong></div>`,
     `<div>Latest <strong>${score.blue ?? 0}-${score.red ?? 0}</strong> · xG <strong>${xg.blue ?? 0}-${xg.red ?? 0}</strong> · +<strong>${match.added_time || 0}</strong></div>`,
     `<div>Set pieces <strong>C ${restarts.blue_corners || 0}-${restarts.red_corners || 0}</strong> · FK <strong>${restarts.blue_free_kicks || 0}-${restarts.red_free_kicks || 0}</strong> · GK <strong>${restarts.blue_goal_kicks || 0}-${restarts.red_goal_kicks || 0}</strong></div>`,
@@ -1317,8 +1336,12 @@ function renderRl(data) {
   ].join("");
   if (data.config) {
     if (document.activeElement !== rl.rate) rl.rate.value = Number(data.config.learning_rate || 0.0008).toFixed(4);
+    if (document.activeElement !== rl.gamma) rl.gamma.value = Number(data.config.gamma || 0.985).toFixed(3);
+    if (document.activeElement !== rl.temperature) rl.temperature.value = Number(data.config.temperature || 1.15).toFixed(2);
     if (document.activeElement !== rl.selfPlay) rl.selfPlay.checked = Boolean(data.config.self_play);
     if (rl.league && document.activeElement !== rl.league) rl.league.checked = Boolean(data.config.league_enabled);
+    if (rl.coach && document.activeElement !== rl.coach) rl.coach.checked = Boolean(data.config.coach_enabled);
+    if (rl.coachRate && document.activeElement !== rl.coachRate) rl.coachRate.value = Number(data.config.coach_rate || 0).toFixed(4);
   }
 }
 
@@ -1334,13 +1357,17 @@ if (rl.start) {
   rl.start.addEventListener("click", async () => renderRl(await rlApi("/api/rl/start", rlConfig())));
   rl.pause.addEventListener("click", async () => renderRl(await rlApi("/api/rl/pause", {})));
   rl.step.addEventListener("click", async () => {
-    renderRl(await rlApi("/api/rl/step", { episodes: 20, eval_episodes: 32 }));
+    renderRl(await rlApi("/api/rl/step", { episodes: 10, eval_episodes: 32 }));
     await loadBackendReplay();
   });
   rl.reset.addEventListener("click", async () => renderRl(await rlApi("/api/rl/reset", {})));
   rl.rate.addEventListener("change", async () => renderRl(await rlApi("/api/rl/config", rlConfig())));
+  rl.gamma.addEventListener("change", async () => renderRl(await rlApi("/api/rl/config", rlConfig())));
+  rl.temperature.addEventListener("change", async () => renderRl(await rlApi("/api/rl/config", rlConfig())));
   rl.selfPlay.addEventListener("change", async () => renderRl(await rlApi("/api/rl/config", rlConfig())));
   rl.league.addEventListener("change", async () => renderRl(await rlApi("/api/rl/config", rlConfig())));
+  rl.coach.addEventListener("change", async () => renderRl(await rlApi("/api/rl/config", rlConfig())));
+  rl.coachRate.addEventListener("change", async () => renderRl(await rlApi("/api/rl/config", rlConfig())));
   rl.replay.addEventListener("click", async () => { await loadBackendReplay(); });
   rl.replayPlay.addEventListener("click", async () => {
     if (!backendReplay.frames.length) await loadBackendReplay();

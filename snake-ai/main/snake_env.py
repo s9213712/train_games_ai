@@ -104,6 +104,7 @@ class BaseSnakeEnv(gym.Env, ABC):
         head = tuple(info["snake_head_pos"])
         loop_revisit = False
         oscillation = False
+        info["starved"] = False
 
         if info["snake_size"] == self.grid_size:
             terminated = True
@@ -114,7 +115,12 @@ class BaseSnakeEnv(gym.Env, ABC):
 
         if self.reward_step_counter > self.step_limit:
             self.reward_step_counter = 0
-            truncated = True
+            # This is an in-MDP starvation/failure condition: the agent failed
+            # to reach food within the configured budget and receives the death
+            # penalty below.  Marking it as a Gym time-limit truncation would
+            # make SB3 bootstrap a terminal value on top of that penalty.
+            terminated = True
+            info["starved"] = True
 
         if not terminated and not truncated and not info["food_obtained"]:
             loop_revisit = head in self.recent_head_positions
@@ -192,6 +198,7 @@ class BaseSnakeEnv(gym.Env, ABC):
             "loop_revisit_count": self.loop_revisit_count,
             "oscillation": False,
             "oscillation_count": self.oscillation_count,
+            "starved": False,
             "reachable_space": 0,
             "reachable_space_ratio": 1.0,
         }

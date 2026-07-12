@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import random
 import tempfile
 import threading
@@ -7,6 +8,9 @@ import time
 import zipfile
 import os
 import sys
+import atexit
+import hashlib
+import shutil
 from collections import deque
 from pathlib import Path
 
@@ -42,6 +46,23 @@ MODEL_UPLOAD_ENABLED = os.environ.get("SNAKE_ENABLE_MODEL_UPLOAD", "").strip().l
     "on",
 }
 THREAD_JOIN_TIMEOUT_SECONDS = float(os.environ.get("SNAKE_THREAD_JOIN_TIMEOUT_SECONDS", "5"))
+DASHBOARD_BUNDLE_FORMAT = "snake-ai-dashboard-bundle"
+DASHBOARD_BUNDLE_FORMAT_VERSION = 2
+FIXED_HOLDOUT_KIND = "fixed_holdout_v1"
+FIXED_HOLDOUT_PROTOCOL_VERSION = 1
+HOLDOUT_EVAL_CONFIG_KEYS = (
+    "agent",
+    "board_size",
+    "cnn_channel_first",
+    "food_time_penalty",
+    "food_step_limit_multiplier",
+    "food_reward_bonus",
+    "distance_reward_scale",
+    "loop_penalty",
+    "loop_window",
+    "oscillation_penalty",
+    "oscillation_window",
+)
 
 
 DEFAULT_CONFIG = {
@@ -63,11 +84,13 @@ DEFAULT_CONFIG = {
     "strategy": "model",
     "complete_episode_preview": True,
     "deterministic_preview": True,
-    "training_enabled": False,
+    "training_enabled": True,
     "guard_enabled": True,
     "guard_eval_episodes": 8,
     "guard_eval_steps": 600,
-    "guard_min_delta": 0.0,
+    "guard_min_delta": 0.001,
+    "guard_holdout_episodes": 8,
+    "guard_holdout_max_drop": 0.0,
     "food_time_penalty": 0.0,
     "food_step_limit_multiplier": 4.0,
     "food_reward_bonus": 0.0,
@@ -118,10 +141,16 @@ class TrainingDashboard:
         self.best_score_trained_steps = 0
         self.best_score_iteration = 0
         self.best_guard_objective = float("-inf")
+        self.guard_benchmark = {}
+        self.holdout_protocol = {}
+        self.resume_best_bundle = None
         self.last_guard = {}
         self.actual_device = None
         self.last_error = None
         self.last_event = "idle"
+        self.startup_notice = None
+        self.closed = False
+        self._restore_persisted_best_checkpoint()
 
     def _stop_active_thread(self):
         with self.lock:
@@ -132,13 +161,16 @@ class TrainingDashboard:
             active_thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
             if active_thread.is_alive():
                 with self.lock:
-                    self.stop_requested = False
                     self.last_event = "waiting for training chunk to finish"
                     self.last_error = (
                         "Training is still finishing its current chunk. "
                         "Pause and retry after the current chunk completes."
                     )
                 raise RuntimeError(self.last_error)
+        with self.lock:
+            if self.thread is active_thread:
+                self.thread = None
+            self.stop_requested = False
 
     def snapshot(self):
         with self.lock:
@@ -167,10 +199,12 @@ class TrainingDashboard:
                 "config": dict(self.config),
                 "last_error": self.last_error,
                 "last_event": self.last_event,
+                "model_upload_enabled": MODEL_UPLOAD_ENABLED,
             }
 
     def start(self):
         with self.lock:
+            self.closed = False
             self.running = True
             self.stop_requested = False
             self.last_event = "starting"
@@ -186,34 +220,72 @@ class TrainingDashboard:
     def reset(self, updates=None):
         self._stop_active_thread()
 
-        with self.lock:
-            if updates:
-                self._merge_config(updates)
-            if self.train_env is not None:
-                self.train_env.close()
-            self.model = None
-            self.train_env = None
-            self.thread = None
-            self.stop_requested = False
-            self.trained_steps = 0
-            self.iteration = 0
-            self.frames = []
-            self.frame_version += 1
-            self.history = []
-            self.best_score = 0
-            self.best_score_steps = 0
-            self.best_score_trained_steps = 0
-            self.best_score_iteration = 0
-            self.best_guard_objective = float("-inf")
-            self.last_guard = {}
-            self.actual_device = None
-            self.last_error = None
-            self.last_event = "reset"
+        # Reset participates in the same model-I/O -> state-lock ordering as
+        # export/import/training, so a concurrent download cannot observe a
+        # half-reset model.
+        with self.model_io_lock:
+            with self.lock:
+                if updates:
+                    self._merge_config(updates)
+                if self.train_env is not None:
+                    self.train_env.close()
+                self.model = None
+                self.train_env = None
+                self.thread = None
+                self.stop_requested = False
+                self.trained_steps = 0
+                self.iteration = 0
+                self.frames = []
+                self.frame_version += 1
+                self.history = []
+                self.best_score = 0
+                self.best_score_steps = 0
+                self.best_score_trained_steps = 0
+                self.best_score_iteration = 0
+                protected_preserved = self._benchmark_matches_model_config(
+                    self.guard_benchmark
+                ) and BEST_MODEL_PATH.exists()
+                if not protected_preserved:
+                    self.best_guard_objective = float("-inf")
+                    self.guard_benchmark = {}
+                    self.holdout_protocol = {}
+                    self.resume_best_bundle = None
+                else:
+                    self.resume_best_bundle = BEST_MODEL_PATH
+                self.last_guard = {}
+                self.actual_device = None
+                self.last_error = None
+                self.last_event = (
+                    "reset; protected fixed-holdout best preserved"
+                    if protected_preserved
+                    else "reset; starting a new fixed-holdout benchmark"
+                )
+
+    def close(self):
+        """Stop the worker and close its VecEnv without racing model I/O."""
+
+        try:
+            self._stop_active_thread()
+        except RuntimeError:
+            # Keep stop_requested set; the daemon worker will exit at the next
+            # transaction boundary rather than silently resuming.
+            return False
+        with self.model_io_lock:
+            with self.lock:
+                if self.train_env is not None:
+                    self.train_env.close()
+                self.train_env = None
+                self.model = None
+                self.thread = None
+                self.running = False
+                self.closed = True
+                self.last_event = "closed"
+        return True
 
     def _model_bundle_metadata(self, *, extra=None):
         metadata = {
-            "format": "snake-ai-dashboard-bundle",
-            "format_version": 1,
+            "format": DASHBOARD_BUNDLE_FORMAT,
+            "format_version": DASHBOARD_BUNDLE_FORMAT_VERSION,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "config": dict(self.config),
             "trained_steps": int(self.model.num_timesteps) if self.model is not None else self.trained_steps,
@@ -225,21 +297,320 @@ class TrainingDashboard:
                 "trained_steps": self.best_score_trained_steps,
                 "iteration": self.best_score_iteration,
                 "guard_objective": None if self.best_guard_objective == float("-inf") else self.best_guard_objective,
+                "guard_objective_kind": FIXED_HOLDOUT_KIND,
             },
+            "guard_benchmark": dict(self.guard_benchmark),
             "last_event": self.last_event,
         }
         if extra:
             metadata.update(extra)
         return metadata
 
+    @staticmethod
+    def _read_bundle_metadata(bundle_path):
+        path = Path(bundle_path)
+        if not path.exists():
+            return None
+        try:
+            with zipfile.ZipFile(path) as bundle:
+                if "metadata.json" not in bundle.namelist():
+                    return None
+                info = bundle.getinfo("metadata.json")
+                if info.file_size > 1024 * 1024:
+                    return None
+                metadata = json.loads(bundle.read("metadata.json").decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError, zipfile.BadZipFile, json.JSONDecodeError):
+            return None
+        return metadata if isinstance(metadata, dict) else None
+
+    @staticmethod
+    def _validated_guard_benchmark(metadata):
+        benchmark = metadata.get("guard_benchmark") if isinstance(metadata, dict) else None
+        if not isinstance(benchmark, dict) or benchmark.get("kind") != FIXED_HOLDOUT_KIND:
+            return {}
+        protocol = benchmark.get("protocol")
+        try:
+            objective = float(benchmark.get("objective"))
+            protocol_version = int(protocol["version"])
+            seed_base = int(protocol["seed_base"])
+            episodes = int(protocol["episodes"])
+            max_steps = int(protocol["max_steps"])
+            eval_config = dict(protocol["eval_config"])
+            metrics = dict(benchmark["metrics"])
+            metrics_objective = float(metrics["objective"])
+            metrics_episodes = int(metrics["episodes"])
+        except (TypeError, ValueError, KeyError):
+            return {}
+        if (
+            protocol_version != FIXED_HOLDOUT_PROTOCOL_VERSION
+            or not math.isfinite(objective)
+            or not math.isfinite(metrics_objective)
+            or not math.isclose(objective, metrics_objective, rel_tol=0.0, abs_tol=1e-9)
+            or seed_base < 0
+            or episodes < 8
+            or metrics_episodes != episodes
+            or max_steps < 1
+        ):
+            return {}
+        required = set(HOLDOUT_EVAL_CONFIG_KEYS)
+        if not required.issubset(eval_config):
+            return {}
+        clean_protocol = {
+            "version": FIXED_HOLDOUT_PROTOCOL_VERSION,
+            "seed_base": seed_base,
+            "episodes": episodes,
+            "max_steps": max_steps,
+            "eval_config": {key: eval_config[key] for key in HOLDOUT_EVAL_CONFIG_KEYS},
+        }
+        return {
+            "kind": FIXED_HOLDOUT_KIND,
+            "protocol": clean_protocol,
+            "objective": objective,
+            "metrics": metrics,
+        }
+
+    @staticmethod
+    def _has_resumable_bundle_format(metadata):
+        if not isinstance(metadata, dict) or metadata.get("format") != DASHBOARD_BUNDLE_FORMAT:
+            return False
+        version = metadata.get("format_version")
+        return isinstance(version, int) and not isinstance(version, bool) and version >= 2
+
+    def _clear_verified_provenance(self, *, reset_progress=False):
+        self.guard_benchmark = {}
+        self.holdout_protocol = {}
+        self.best_guard_objective = float("-inf")
+        self.resume_best_bundle = None
+        self.last_guard = {}
+        if reset_progress:
+            self.trained_steps = 0
+            self.iteration = 0
+            self.history = []
+            self.best_score = 0
+            self.best_score_steps = 0
+            self.best_score_trained_steps = 0
+            self.best_score_iteration = 0
+
+    def _quarantine_persisted_best(self, reason):
+        """Move an untrusted/stale protected path aside before model loading."""
+
+        self._clear_verified_provenance(reset_progress=True)
+        safe_reason = "".join(
+            character if character.isalnum() else "-" for character in str(reason).lower()
+        ).strip("-") or "invalid"
+        quarantine_path = None
+        if BEST_MODEL_PATH.exists():
+            quarantine_path = BEST_MODEL_PATH.with_name(
+                f"{BEST_MODEL_PATH.stem}.quarantine-{safe_reason}-{time.time_ns()}"
+                f"{BEST_MODEL_PATH.suffix}"
+            )
+            try:
+                os.replace(BEST_MODEL_PATH, quarantine_path)
+            except OSError as exc:
+                quarantine_path = None
+                self.last_error = f"Could not quarantine stale protected bundle: {exc}"
+
+        if quarantine_path is not None:
+            notice = (
+                f"quarantined stale protected bundle ({reason}) as "
+                f"{quarantine_path.name}; using baseline fallback"
+            )
+        else:
+            notice = (
+                f"ignored stale protected bundle ({reason}); using baseline fallback"
+            )
+        self.startup_notice = notice
+        self.last_event = notice
+        return quarantine_path
+
+    def _restore_persisted_best_checkpoint(self):
+        if not BEST_MODEL_PATH.exists():
+            return
+        metadata = self._read_bundle_metadata(BEST_MODEL_PATH)
+        if not metadata:
+            self._quarantine_persisted_best("missing or invalid metadata")
+            return
+        if not self._has_resumable_bundle_format(metadata):
+            self._quarantine_persisted_best("legacy or stale format")
+            return
+        benchmark = self._validated_guard_benchmark(metadata)
+        if not benchmark:
+            self._quarantine_persisted_best("missing or invalid fixed-holdout benchmark")
+            return
+        bundle_config = metadata.get("config")
+        if not isinstance(bundle_config, dict):
+            self._quarantine_persisted_best("missing model configuration")
+            return
+        original_config = dict(self.config)
+        try:
+            self._merge_config(bundle_config)
+        except (TypeError, ValueError):
+            self.config = original_config
+            self._quarantine_persisted_best("invalid model configuration")
+            return
+        if not self._benchmark_matches_model_config(benchmark):
+            self.config = original_config
+            self._quarantine_persisted_best("fixed-holdout protocol does not match configuration")
+            return
+        try:
+            history = metadata.get("history") or []
+            if not isinstance(history, list):
+                raise TypeError("history must be a list")
+            trained_steps = max(0, int(metadata.get("trained_steps") or 0))
+            iteration = max(0, int(metadata.get("iteration") or 0))
+            best = metadata.get("best") if isinstance(metadata.get("best"), dict) else {}
+            best_score = max(0, int(best.get("score") or 0))
+            best_score_steps = max(0, int(best.get("steps") or 0))
+            best_score_trained_steps = max(0, int(best.get("trained_steps") or 0))
+            best_score_iteration = max(0, int(best.get("iteration") or 0))
+        except (TypeError, ValueError):
+            self.config = original_config
+            self._quarantine_persisted_best("invalid persisted training state")
+            return
+
+        self.resume_best_bundle = BEST_MODEL_PATH
+        self.trained_steps = trained_steps
+        self.iteration = iteration
+        self.history = history
+        self.best_score = best_score
+        self.best_score_steps = best_score_steps
+        self.best_score_trained_steps = best_score_trained_steps
+        self.best_score_iteration = best_score_iteration
+        self._restore_last_guard(metadata)
+        self.guard_benchmark = benchmark
+        self.holdout_protocol = dict(benchmark["protocol"])
+        self.best_guard_objective = float(benchmark["objective"])
+        self.last_event = (
+            f"protected best ready ({self.best_guard_objective:.5f} fixed holdout)"
+        )
+
+    def _expected_holdout_protocol(self):
+        return {
+            "version": FIXED_HOLDOUT_PROTOCOL_VERSION,
+            "seed_base": int(self.config["seed"]) + 5_000_000,
+            "episodes": max(8, int(self.config["guard_holdout_episodes"])),
+            "max_steps": int(self.config["guard_eval_steps"]),
+            "eval_config": {
+                key: self.config[key] for key in HOLDOUT_EVAL_CONFIG_KEYS
+            },
+        }
+
+    def _benchmark_matches_model_config(self, benchmark):
+        benchmark = benchmark if isinstance(benchmark, dict) else {}
+        protocol = benchmark.get("protocol") if isinstance(benchmark, dict) else None
+        return isinstance(protocol, dict) and protocol == self._expected_holdout_protocol()
+
+    def _protocol_matches_model_config(self, protocol):
+        return self._benchmark_matches_model_config({"protocol": protocol})
+
+    def _holdout_protocol(self):
+        if self._protocol_matches_model_config(self.holdout_protocol):
+            return dict(self.holdout_protocol)
+        if self._benchmark_matches_model_config(self.guard_benchmark):
+            self.holdout_protocol = dict(self.guard_benchmark["protocol"])
+            return dict(self.holdout_protocol)
+        self.guard_benchmark = {}
+        self.best_guard_objective = float("-inf")
+        self.resume_best_bundle = None
+        self.holdout_protocol = self._expected_holdout_protocol()
+        return dict(self.holdout_protocol)
+
+    @staticmethod
+    def _protocol_id(protocol):
+        raw = json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:12]
+
     def _write_model_bundle(self, destination: Path, metadata: dict) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        os.close(file_descriptor)
+        temporary_destination = Path(temporary_name)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                model_path = Path(tmpdir) / "model.zip"
+                self.model.save(model_path)
+                with zipfile.ZipFile(
+                    temporary_destination,
+                    mode="w",
+                    compression=zipfile.ZIP_DEFLATED,
+                ) as bundle:
+                    bundle.write(model_path, "model.zip")
+                    bundle.writestr("metadata.json", json.dumps(metadata, indent=2))
+                os.replace(temporary_destination, destination)
+            finally:
+                temporary_destination.unlink(missing_ok=True)
+
+    def _promote_fixed_holdout_best(self, *, protocol, metrics, guard):
+        """Atomically promote only a strictly better comparable holdout result."""
+
+        objective = float(metrics["objective"])
+        existing_metadata = self._read_bundle_metadata(BEST_MODEL_PATH) or {}
+        existing_benchmark = self._validated_guard_benchmark(existing_metadata)
+        same_protocol = bool(existing_benchmark) and existing_benchmark.get("protocol") == protocol
+        existing_objective = (
+            float(existing_benchmark["objective"])
+            if same_protocol
+            else float("-inf")
+        )
+        in_memory_objective = (
+            self.best_guard_objective
+            if self.guard_benchmark.get("protocol") == protocol
+            else float("-inf")
+        )
+        if objective <= max(existing_objective, in_memory_objective):
+            return False
+
+        # Preserve an incompatible protocol's best under a stable archive name;
+        # objectives from different boards/observation layouts are not compared.
+        if existing_benchmark and not same_protocol and BEST_MODEL_PATH.exists():
+            old_id = self._protocol_id(existing_benchmark["protocol"])
+            archive = BEST_MODEL_PATH.with_name(
+                f"{BEST_MODEL_PATH.stem}.{old_id}{BEST_MODEL_PATH.suffix}"
+            )
+            if not archive.exists():
+                shutil.copy2(BEST_MODEL_PATH, archive)
+
+        previous_benchmark = dict(self.guard_benchmark)
+        previous_protocol = dict(self.holdout_protocol)
+        previous_objective = self.best_guard_objective
+        self.guard_benchmark = {
+            "kind": FIXED_HOLDOUT_KIND,
+            "protocol": dict(protocol),
+            "objective": objective,
+            "metrics": dict(metrics),
+        }
+        self.holdout_protocol = dict(protocol)
+        self.best_guard_objective = objective
+        try:
+            metadata = self._model_bundle_metadata(
+                extra={
+                    "guard_objective": objective,
+                    "guard_objective_kind": FIXED_HOLDOUT_KIND,
+                    "guard": dict(guard, promoted_to_best=True),
+                }
+            )
+            self._write_model_bundle(BEST_MODEL_PATH, metadata)
+        except Exception:
+            self.guard_benchmark = previous_benchmark
+            self.holdout_protocol = previous_protocol
+            self.best_guard_objective = previous_objective
+            raise
+        self.resume_best_bundle = BEST_MODEL_PATH
+        return True
+
+    def _load_model_from_bundle(self, bundle_path, env, device):
         with tempfile.TemporaryDirectory() as tmpdir:
             model_path = Path(tmpdir) / "model.zip"
-            self.model.save(model_path)
-            with zipfile.ZipFile(destination, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
-                bundle.write(model_path, "model.zip")
-                bundle.writestr("metadata.json", json.dumps(metadata, indent=2))
+            with zipfile.ZipFile(bundle_path) as bundle:
+                info = bundle.getinfo("model.zip")
+                if info.file_size > MAX_MODEL_UPLOAD_BYTES:
+                    raise ValueError("Protected model bundle is too large")
+                model_path.write_bytes(bundle.read("model.zip"))
+            return self._load_model(model_path, env, device)
 
     def export_model_bundle(self):
         with self.model_io_lock:
@@ -285,6 +656,8 @@ class TrainingDashboard:
                         raise ValueError("Uploaded model bundle contents are too large.")
                     model_path.write_bytes(uploaded_zip.read("model.zip"))
                     metadata = json.loads(uploaded_zip.read("metadata.json").decode("utf-8"))
+                    if not isinstance(metadata, dict):
+                        raise ValueError("Bundle metadata must be a JSON object")
                 else:
                     model_path.write_bytes(upload_path.read_bytes())
 
@@ -325,6 +698,14 @@ class TrainingDashboard:
         return self.snapshot()
 
     def _replace_model_from_file(self, model_path, metadata):
+        """Load a trusted manual import as an explicitly unverified baseline.
+
+        SB3 archives are trusted-code inputs, but dashboard metadata is not
+        proof that the imported weights produced its claimed evaluation.  In
+        particular, legacy guard/history fields must never enter the protected
+        fixed-holdout provenance chain.
+        """
+
         self._stop_active_thread()
 
         with self.model_io_lock:
@@ -345,17 +726,41 @@ class TrainingDashboard:
                 self.thread = None
                 self.running = False
                 self.stop_requested = False
-                self.trained_steps = int(metadata.get("trained_steps") or self.model.num_timesteps or 0)
-                self.iteration = int(metadata.get("iteration") or 0)
-                self.history = list(metadata.get("history") or [])
-                self._restore_best(metadata)
+                self.trained_steps = max(0, int(self.model.num_timesteps or 0))
+                self.iteration = 0
+                self.history = []
+                self._clear_verified_provenance()
+                self.best_score = 0
+                self.best_score_steps = 0
+                self.best_score_trained_steps = 0
+                self.best_score_iteration = 0
                 self.frames = []
                 self.frame_version += 1
                 self.last_error = None
                 self.actual_device = str(self.model.device)
-                self.last_event = f"imported model at {self.trained_steps} steps"
+                self.startup_notice = None
+                self.last_event = (
+                    f"trusted model imported as unverified baseline at "
+                    f"{self.trained_steps} model steps; provenance cleared"
+                )
+
+    def _restore_last_guard(self, metadata):
+        guard = metadata.get("guard") if isinstance(metadata, dict) else None
+        if not isinstance(guard, dict):
+            for item in reversed(self.history):
+                candidate = item.get("guard") if isinstance(item, dict) else None
+                if isinstance(candidate, dict):
+                    guard = candidate
+                    break
+        self.last_guard = dict(guard) if isinstance(guard, dict) else {}
 
     def _restore_best(self, metadata):
+        benchmark = self._validated_guard_benchmark(metadata if isinstance(metadata, dict) else {})
+        self.guard_benchmark = benchmark
+        self.holdout_protocol = dict(benchmark.get("protocol") or {})
+        self.best_guard_objective = (
+            float(benchmark["objective"]) if benchmark else float("-inf")
+        )
         best = metadata.get("best") if isinstance(metadata, dict) else None
         if isinstance(best, dict):
             self.best_score = int(best.get("score") or 0)
@@ -372,6 +777,8 @@ class TrainingDashboard:
             self._update_best(item)
 
     def _update_best(self, summary):
+        if summary.get("preview_strategy", "model") != "model":
+            return
         score = int(summary.get("preview_score") or 0)
         steps = int(summary.get("preview_steps") or 0)
         if score < self.best_score:
@@ -394,12 +801,24 @@ class TrainingDashboard:
             },
         )
 
+    def _rollback_guard_candidate(self, checkpoint):
+        """Restore policy, optimizer, schedules, and timestep count."""
+
+        self.model = self._load_model(checkpoint, self.train_env, self.model.device)
+
+    def _is_new_best_guard(self, objective):
+        return float(objective) > self.best_guard_objective
+
     def update_config(self, updates):
-        with self.lock:
-            self._merge_config(updates)
-            self._apply_live_config()
-            self.last_event = "settings updated"
-            return dict(self.config)
+        # Match the model-I/O -> state-lock ordering used by training/export.
+        # A live update then cannot alter the policy or environment halfway
+        # through a guarded baseline/train/candidate transaction.
+        with self.model_io_lock:
+            with self.lock:
+                self._merge_config(updates)
+                self._apply_live_config()
+                self.last_event = "settings updated"
+                return dict(self.config)
 
     def _merge_config(self, updates):
         for key, value in updates.items():
@@ -411,7 +830,7 @@ class TrainingDashboard:
                 self.config[key] = self._normalize_int_list(value)
             elif key in {"deterministic_preview", "complete_episode_preview", "cnn_channel_first", "training_enabled", "guard_enabled"}:
                 self.config[key] = bool(value)
-            elif key in {"board_size", "seed", "n_steps", "batch_size", "num_envs", "n_epochs", "chunk_timesteps", "preview_steps", "loop_window", "oscillation_window", "cnn_features_dim", "guard_eval_episodes", "guard_eval_steps"}:
+            elif key in {"board_size", "seed", "n_steps", "batch_size", "num_envs", "n_epochs", "chunk_timesteps", "preview_steps", "loop_window", "oscillation_window", "cnn_features_dim", "guard_eval_episodes", "guard_eval_steps", "guard_holdout_episodes"}:
                 self.config[key] = max(1, int(value))
             else:
                 self.config[key] = float(value)
@@ -426,9 +845,16 @@ class TrainingDashboard:
         self.config["board_size"] = max(4, self.config["board_size"])
         self.config["chunk_timesteps"] = max(16, self.config["chunk_timesteps"])
         self.config["preview_steps"] = max(10, self.config["preview_steps"])
-        self.config["guard_eval_episodes"] = max(2, min(64, self.config["guard_eval_episodes"]))
+        self.config["guard_eval_episodes"] = max(4, min(64, self.config["guard_eval_episodes"]))
         self.config["guard_eval_steps"] = max(50, min(5000, self.config["guard_eval_steps"]))
-        self.config["guard_min_delta"] = max(-1000.0, min(1000.0, self.config["guard_min_delta"]))
+        self.config["guard_min_delta"] = max(0.0, min(1000.0, self.config["guard_min_delta"]))
+        # Production training is always guarded; preview-only mode is controlled
+        # by training_enabled rather than silently accepting unverified PPO.
+        self.config["guard_enabled"] = True
+        self.config["guard_holdout_episodes"] = max(
+            8, min(32, self.config["guard_holdout_episodes"])
+        )
+        self.config["guard_holdout_max_drop"] = 0.0
         self.config["batch_size"] = max(8, self.config["batch_size"])
         self.config["n_steps"] = max(8, self.config["n_steps"])
         self.config["num_envs"] = max(1, self.config["num_envs"])
@@ -603,24 +1029,28 @@ class TrainingDashboard:
 
         return DummyVecEnv([lambda rank=rank: _init(rank) for rank in range(self.config["num_envs"])])
 
-    def _make_eval_env(self, seed):
-        env_cls = self._env_class()
+    def _make_eval_env(self, seed, eval_config=None):
+        # A guard comparison must use one immutable environment specification.
+        # Copying here also protects direct evaluator callers from live dashboard
+        # updates that arrive between episodes.
+        config = dict(eval_config) if eval_config is not None else dict(self.config)
+        env_cls = SnakeCnnEnv if config["agent"] == "cnn" else SnakeMlpEnv
         env_kwargs = {
             "seed": seed,
-            "board_size": self.config["board_size"],
+            "board_size": config["board_size"],
             "silent_mode": True,
             "limit_step": True,
-            "food_time_penalty": self.config["food_time_penalty"],
-            "food_step_limit_multiplier": self.config["food_step_limit_multiplier"],
-            "food_reward_bonus": self.config["food_reward_bonus"],
-            "distance_reward_scale": self.config["distance_reward_scale"],
-            "loop_penalty": self.config["loop_penalty"],
-            "loop_window": self.config["loop_window"],
-            "oscillation_penalty": self.config["oscillation_penalty"],
-            "oscillation_window": self.config["oscillation_window"],
+            "food_time_penalty": config["food_time_penalty"],
+            "food_step_limit_multiplier": config["food_step_limit_multiplier"],
+            "food_reward_bonus": config["food_reward_bonus"],
+            "distance_reward_scale": config["distance_reward_scale"],
+            "loop_penalty": config["loop_penalty"],
+            "loop_window": config["loop_window"],
+            "oscillation_penalty": config["oscillation_penalty"],
+            "oscillation_window": config["oscillation_window"],
         }
         if env_cls is SnakeCnnEnv:
-            env_kwargs["channel_first"] = self.config["cnn_channel_first"]
+            env_kwargs["channel_first"] = config["cnn_channel_first"]
         return env_cls(**env_kwargs)
 
     def _guard_objective(self, metrics):
@@ -630,13 +1060,81 @@ class TrainingDashboard:
             + float(metrics.get("avg_reward", 0.0)) * 0.05
         )
 
-    def _evaluate_model_score(self, model, *, seed_base, episodes, max_steps):
+    @staticmethod
+    def _guard_decision(
+        baseline,
+        candidate,
+        *,
+        min_delta,
+        holdout_baseline=None,
+        holdout_candidate=None,
+        holdout_max_drop=0.0,
+    ):
+        """Return an evidence-based behavior gate decision.
+
+        A weight change alone cannot pass: the candidate must improve the
+        deterministic, same-seed development objective by a non-zero practical
+        effect while not reducing food collection.  A fixed holdout, when
+        supplied, additionally prevents accepting a development-only gain that
+        regresses on the stable reference set.
+        """
+
+        required_delta = max(float(min_delta), 1e-5)
+        development_delta = float(candidate["objective"]) - float(baseline["objective"])
+        food_delta = float(candidate.get("avg_food", 0.0)) - float(
+            baseline.get("avg_food", 0.0)
+        )
+        development_pass = development_delta + 1e-12 >= required_delta and food_delta >= 0.0
+
+        holdout_delta = None
+        holdout_food_delta = None
+        holdout_pass = True
+        if holdout_baseline is not None and holdout_candidate is not None:
+            holdout_delta = float(holdout_candidate["objective"]) - float(
+                holdout_baseline["objective"]
+            )
+            holdout_food_delta = float(holdout_candidate.get("avg_food", 0.0)) - float(
+                holdout_baseline.get("avg_food", 0.0)
+            )
+            max_drop = max(0.0, float(holdout_max_drop))
+            holdout_pass = holdout_delta + 1e-12 >= -max_drop and holdout_food_delta >= 0.0
+
+        accepted = bool(development_pass and holdout_pass)
+        if not development_pass:
+            reason = "no_measured_behavior_improvement"
+        elif not holdout_pass:
+            reason = "fixed_holdout_regression"
+        else:
+            reason = "behavior_improved_and_holdout_preserved"
+        return {
+            "accepted": accepted,
+            "reason": reason,
+            "required_delta": required_delta,
+            "development_delta": round(development_delta, 5),
+            "development_food_delta": round(food_delta, 5),
+            "holdout_delta": None if holdout_delta is None else round(holdout_delta, 5),
+            "holdout_food_delta": (
+                None if holdout_food_delta is None else round(holdout_food_delta, 5)
+            ),
+        }
+
+    def _evaluate_model_score(
+        self,
+        model,
+        *,
+        seed_base,
+        episodes,
+        max_steps,
+        eval_config=None,
+    ):
+        eval_config = dict(eval_config) if eval_config is not None else dict(self.config)
         scores = []
         foods = []
         rewards = []
+        episode_results = []
         for index in range(int(episodes)):
             seed = seed_base + index
-            env = self._make_eval_env(seed)
+            env = self._make_eval_env(seed, eval_config)
             try:
                 obs, _info = env.reset(seed=seed)
                 done = False
@@ -657,6 +1155,15 @@ class TrainingDashboard:
                 scores.append(len(env.game.snake) - env.init_snake_size)
                 foods.append(food_count)
                 rewards.append(total_reward)
+                episode_results.append(
+                    {
+                        "seed": seed,
+                        "score": scores[-1],
+                        "food": food_count,
+                        "reward": round(total_reward, 6),
+                        "steps": steps,
+                    }
+                )
             finally:
                 env.close()
         count = max(1, len(scores))
@@ -665,6 +1172,7 @@ class TrainingDashboard:
             "avg_score": round(sum(scores) / count, 4),
             "avg_food": round(sum(foods) / count, 4),
             "avg_reward": round(sum(rewards) / count, 5),
+            "episode_results": episode_results,
         }
         metrics["objective"] = round(self._guard_objective(metrics), 5)
         return metrics
@@ -678,13 +1186,31 @@ class TrainingDashboard:
         torch.manual_seed(seed)
         self.train_env = self._make_train_env()
         device = select_device(self.config["device"])
+        protected_bundle = (
+            Path(self.resume_best_bundle)
+            if self.resume_best_bundle and Path(self.resume_best_bundle).exists()
+            else None
+        )
         original_model_path = self._initial_model_path(device)
-        if original_model_path is not None:
+        if protected_bundle is not None:
+            try:
+                self.model = self._load_model_from_bundle(
+                    protected_bundle,
+                    self.train_env,
+                    device,
+                )
+                if self.trained_steps == 0:
+                    self.trained_steps = int(self.model.num_timesteps or 0)
+                source_event = f"resumed protected fixed-holdout best from {protected_bundle.name}"
+            except (OSError, ValueError, KeyError, RuntimeError, EOFError, zipfile.BadZipFile):
+                self._quarantine_persisted_best("protected model weights failed to load")
+                self.model = None
+        if self.model is None and original_model_path is not None:
             self.model = self._load_model(original_model_path, self.train_env, device)
             if self.trained_steps == 0:
                 self.trained_steps = int(self.model.num_timesteps or 0)
             source_event = f"loaded original model from {original_model_path.relative_to(MAIN_DIR)}"
-        else:
+        elif self.model is None:
             self.model = MaskablePPO(
                 self._policy(),
                 self.train_env,
@@ -700,6 +1226,8 @@ class TrainingDashboard:
                 policy_kwargs=self._cnn_policy_kwargs() if self.config["agent"] == "cnn" else None,
             )
             source_event = "created new model"
+        if self.startup_notice:
+            source_event = f"{self.startup_notice}; {source_event}"
         self._apply_live_config()
         self.actual_device = str(self.model.device)
         if self.actual_device != str(device):
@@ -742,6 +1270,118 @@ class TrainingDashboard:
                 env.loop_window = loop_window
                 env.recent_head_positions = deque(positions, maxlen=loop_window)
 
+    def _run_guarded_training_transaction(self, chunk):
+        """Train/evaluate one candidate, rolling back every pre-commit failure."""
+
+        guard_seed = int(self.config["seed"]) + self.iteration * 10_007 + 50_000
+        guard_episodes = int(self.config["guard_eval_episodes"])
+        guard_steps = int(self.config["guard_eval_steps"])
+        min_delta = float(self.config["guard_min_delta"])
+        holdout_protocol = self._holdout_protocol()
+        holdout_seed = int(holdout_protocol["seed_base"])
+        holdout_episodes = int(holdout_protocol["episodes"])
+        holdout_steps = int(holdout_protocol["max_steps"])
+        holdout_eval_config = dict(holdout_protocol["eval_config"])
+        eval_config = dict(self.config)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "model_before.zip"
+            self.model.save(checkpoint)
+            candidate_started = False
+            candidate_committed = False
+            try:
+                baseline = self._evaluate_model_score(
+                    self.model,
+                    seed_base=guard_seed,
+                    episodes=guard_episodes,
+                    max_steps=guard_steps,
+                    eval_config=eval_config,
+                )
+                holdout_baseline = self._evaluate_model_score(
+                    self.model,
+                    seed_base=holdout_seed,
+                    episodes=holdout_episodes,
+                    max_steps=holdout_steps,
+                    eval_config=holdout_eval_config,
+                )
+                candidate_start_steps = int(self.model.num_timesteps)
+                candidate_started = True
+                self.model.learn(
+                    total_timesteps=chunk,
+                    reset_num_timesteps=False,
+                    progress_bar=False,
+                )
+                attempted_timesteps = max(
+                    0, int(self.model.num_timesteps) - candidate_start_steps
+                )
+                candidate = self._evaluate_model_score(
+                    self.model,
+                    seed_base=guard_seed,
+                    episodes=guard_episodes,
+                    max_steps=guard_steps,
+                    eval_config=eval_config,
+                )
+                holdout_candidate = self._evaluate_model_score(
+                    self.model,
+                    seed_base=holdout_seed,
+                    episodes=holdout_episodes,
+                    max_steps=holdout_steps,
+                    eval_config=holdout_eval_config,
+                )
+                decision = self._guard_decision(
+                    baseline,
+                    candidate,
+                    min_delta=min_delta,
+                    holdout_baseline=holdout_baseline,
+                    holdout_candidate=holdout_candidate,
+                    holdout_max_drop=0.0,
+                )
+                accepted = decision["accepted"]
+                guard = {
+                    "accepted": accepted,
+                    "reason": decision["reason"],
+                    "episodes": guard_episodes,
+                    "max_steps": guard_steps,
+                    "min_delta": min_delta,
+                    "baseline": baseline,
+                    "candidate": candidate,
+                    "attempted_timesteps": attempted_timesteps,
+                    "decision": decision,
+                    "eval_seed_base": guard_seed,
+                    "holdout_seed_base": holdout_seed,
+                    "holdout_episodes": holdout_episodes,
+                    "holdout_max_steps": holdout_steps,
+                    "holdout_max_drop": 0.0,
+                    "holdout_baseline": holdout_baseline,
+                    "holdout_candidate": holdout_candidate,
+                    "holdout_protocol": holdout_protocol,
+                    "promotion_basis": FIXED_HOLDOUT_KIND,
+                    "candidate_isolated_by_model_io": True,
+                    "evaluation_frozen": True,
+                    "eval_env_wrappers": ["raw_env", "manual_action_mask"],
+                    "promoted_to_best": False,
+                }
+                if not accepted:
+                    self._rollback_guard_candidate(checkpoint)
+                    candidate_started = False
+                    return guard
+                guard["promoted_to_best"] = self._promote_fixed_holdout_best(
+                    protocol=holdout_protocol,
+                    metrics=holdout_candidate,
+                    guard=guard,
+                )
+                candidate_committed = True
+                return guard
+            except BaseException as exc:
+                if candidate_started and not candidate_committed:
+                    try:
+                        self._rollback_guard_candidate(checkpoint)
+                    except Exception as rollback_exc:
+                        raise RuntimeError(
+                            f"candidate failed and rollback also failed: {rollback_exc!r}"
+                        ) from exc
+                raise
+
     def _loop(self):
         while True:
             with self.lock:
@@ -769,62 +1409,7 @@ class TrainingDashboard:
                 guard = {}
                 if training_enabled:
                     with self.model_io_lock:
-                        guard_enabled = bool(self.config["guard_enabled"])
-                        guard_seed = int(self.config["seed"]) + self.iteration * 10_007 + 50_000
-                        guard_episodes = int(self.config["guard_eval_episodes"])
-                        guard_steps = int(self.config["guard_eval_steps"])
-                        min_delta = float(self.config["guard_min_delta"])
-                        with tempfile.TemporaryDirectory() as tmpdir:
-                            checkpoint = Path(tmpdir) / "model_before.zip"
-                            baseline = {}
-                            if guard_enabled:
-                                self.model.save(checkpoint)
-                                baseline = self._evaluate_model_score(
-                                    self.model,
-                                    seed_base=guard_seed,
-                                    episodes=guard_episodes,
-                                    max_steps=guard_steps,
-                                )
-                            self.model.learn(
-                                total_timesteps=chunk,
-                                reset_num_timesteps=False,
-                                progress_bar=False,
-                            )
-                            candidate = {}
-                            accepted = True
-                            if guard_enabled:
-                                candidate = self._evaluate_model_score(
-                                    self.model,
-                                    seed_base=guard_seed,
-                                    episodes=guard_episodes,
-                                    max_steps=guard_steps,
-                                )
-                                accepted = candidate["objective"] >= baseline["objective"] + min_delta
-                                if not accepted:
-                                    self.model = self._load_model(checkpoint, self.train_env, self.model.device)
-                                guard = {
-                                    "accepted": accepted,
-                                    "episodes": guard_episodes,
-                                    "max_steps": guard_steps,
-                                    "min_delta": min_delta,
-                                    "baseline": baseline,
-                                    "candidate": candidate,
-                                    "eval_seed_base": guard_seed,
-                                    "eval_env_wrappers": ["raw_env", "manual_action_mask"],
-                                }
-                                if accepted and candidate["objective"] >= self.best_guard_objective:
-                                    self.best_guard_objective = candidate["objective"]
-                                    self._write_model_bundle(
-                                        BEST_MODEL_PATH,
-                                        self._model_bundle_metadata(
-                                            extra={
-                                                "guard_objective": candidate["objective"],
-                                                "guard": guard,
-                                                "eval_seed_base": guard_seed,
-                                                "eval_env_wrappers": ["raw_env", "manual_action_mask"],
-                                            }
-                                        ),
-                                    )
+                        guard = self._run_guarded_training_transaction(chunk)
                 elapsed = max(0.001, time.time() - start)
                 end_steps = int(self.model.num_timesteps) if self.model is not None else start_steps
                 trained_delta = max(0, end_steps - start_steps)
@@ -851,9 +1436,14 @@ class TrainingDashboard:
                             "num_envs": self.config["num_envs"],
                             "train_seconds": round(elapsed, 3),
                             "fps": round(trained_delta / elapsed, 2),
+                            "preview_strategy": strategy,
                             "time": time.strftime("%H:%M:%S"),
                         }
                     )
+                    if guard:
+                        # Keep rejected attempts in exported history too; a
+                        # rollback should never erase its audit evidence.
+                        summary["guard"] = guard
                     self.frames = frames
                     self.frame_version += 1
                     self.history.append(summary)
@@ -862,8 +1452,13 @@ class TrainingDashboard:
                     if training_enabled:
                         if guard and not guard.get("accepted", True):
                             self.last_event = f"guard rejected candidate at {self.trained_steps} steps"
+                        elif strategy == "hamiltonian":
+                            self.last_event = (
+                                f"PPO trained to {self.trained_steps} steps; "
+                                "canvas is Hamiltonian preview only"
+                            )
                         else:
-                            self.last_event = f"trained to {self.trained_steps} steps"
+                            self.last_event = f"PPO trained to {self.trained_steps} accepted steps"
                     else:
                         self.running = False
                         self.last_event = "previewed without training"
@@ -972,6 +1567,7 @@ class TrainingDashboard:
 
 
 dashboard = TrainingDashboard()
+atexit.register(dashboard.close)
 app = Flask(__name__, static_folder=str(WEB_DIR), static_url_path="")
 
 
