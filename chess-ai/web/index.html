@@ -18,7 +18,7 @@
             </div>
           </div>
           <div class="actions">
-            <button id="startBtn" class="primary">Start</button>
+            <button id="startBtn" class="primary">Start Verified Training</button>
             <button id="pauseBtn">Pause</button>
             <button id="resetBtn">Reset</button>
           </div>
@@ -37,8 +37,8 @@
               <div><span>Win Rate</span><strong id="winRate">0%</strong></div>
               <div><span>Match</span><strong id="matchRate">0%</strong></div>
               <div><span>Samples</span><strong id="samples">0</strong></div>
-              <div><span>TD Error</span><strong id="trainLoss">0</strong></div>
-              <div><span>Strength</span><strong id="strength">800</strong></div>
+              <div><span>Update Signal</span><strong id="trainLoss">0</strong></div>
+              <div><span>Accepted / Rejected</span><strong id="strength">0 / 0</strong></div>
               <div><span>Updates</span><strong id="updates">0</strong></div>
             </div>
           </section>
@@ -57,26 +57,29 @@
 
       <aside class="controls">
         <div class="section-title">Training</div>
+        <p class="hint">Candidates are retained only when both the White-to-move guard and fixed holdout validation improve, with no regression on the fixed promotion audit.</p>
         <label>Teacher Depth <input id="teacherDepth" type="number" min="1" max="18" step="1" /></label>
-        <label>Chunk Moves <input id="chunkMoves" type="number" min="1" max="30" step="1" /></label>
+        <label>Chunk Moves <input id="chunkMoves" type="number" min="1" max="120" step="1" /></label>
         <label>Learning Rate <input id="learningRate" type="number" min="0" max="0.5" step="0.005" /></label>
         <label>Exploration <input id="exploration" type="range" min="0" max="80" value="8" /></label>
         <label>Mutation <input id="mutation" type="range" min="0" max="100" value="12" /></label>
         <div class="grid-two">
-          <button id="stepBtn">Step</button>
-          <button id="burstBtn">Burst</button>
+          <button id="stepBtn">Verify 1 Move</button>
+          <button id="burstBtn">Verify 80 Moves</button>
         </div>
 
-        <div class="section-title">Student Weights</div>
-        <label>Material <input id="wMaterial" type="number" step="0.05" /></label>
-        <label>Mobility <input id="wMobility" type="number" step="0.05" /></label>
-        <label>Center <input id="wCenter" type="number" step="0.05" /></label>
-        <label>King Safety <input id="wKing" type="number" step="0.05" /></label>
-        <button id="applyBtn" class="primary">Apply</button>
+        <div class="section-title">Verified Student Weights (read only)</div>
+        <label>Material <input id="wMaterial" type="number" step="0.05" disabled /></label>
+        <label>Mobility <input id="wMobility" type="number" step="0.05" disabled /></label>
+        <label>Center <input id="wCenter" type="number" step="0.05" disabled /></label>
+        <label>King Safety <input id="wKing" type="number" step="0.05" disabled /></label>
+        <label>Reply Safety <input id="wReply" type="number" step="0.05" disabled /></label>
+        <button id="applyBtn" class="primary">Apply Training Settings</button>
+        <div id="guardBox" class="stockfish warn">No candidate has completed all three checks yet.</div>
         <div id="stockfishBox" class="stockfish"></div>
         <div id="errorBox" class="error" hidden></div>
       </aside>
     </main>
-    <script src="/app.js?v=20260703-learning"></script>
+    <script src="/app.js?v=20260712-integrity"></script>
   </body>
 </html>

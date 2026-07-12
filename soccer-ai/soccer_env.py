@@ -68,7 +68,12 @@ class TacticalSoccerEnv:
     tactical actions and IFAB-inspired rule events.
     """
 
-    def __init__(self, *, seed: int | None = None, max_minutes: int = 90) -> None:
+    def __init__(
+        self,
+        *,
+        seed: int | str | bytes | bytearray | None = None,
+        max_minutes: int = 90,
+    ) -> None:
         self.random = random.Random(seed)
         self.max_minutes = int(max_minutes)
         self.state = SoccerState()

@@ -1,13 +1,58 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import random
 import threading
 import time
 from pathlib import Path
 
 from soccer_env import ACTION_NAMES, TacticalSoccerEnv
+
+
+CHECKPOINT_VERSION = 4
+GUARD_OBJECTIVE_VERSION = 3
+SEED_PROTOCOL_VERSION = 1
+TRAIN_SEED_NAMESPACE = "soccer-ai/train"
+GUARD_GATE_SEED_NAMESPACE = "soccer-ai/fresh-gate"
+GUARD_PROMOTION_SEED_NAMESPACE = "soccer-ai/canonical-promotion"
+GUARD_GATE_SEED_STRIDE = 1_000
+GUARD_PROMOTION_EPISODES = 64
+GUARD_PROMOTION_CONTEXT_VERSION = 1
+GUARD_MIN_EFFECT = 1.0
+
+
+def namespaced_seed(namespace: str, index: int) -> str:
+    """Return a deterministic seed that cannot equal any integer audit seed."""
+
+    index = int(index)
+    if index < 0:
+        raise ValueError("seed index must be non-negative")
+    return f"{namespace}/v{SEED_PROTOCOL_VERSION}/{index}"
+
+
+class _NamespacedSeedBase(str):
+    """String seed base that keeps the legacy ``base + index`` API safe."""
+
+    def __new__(cls, namespace: str):
+        value = namespaced_seed(namespace, 0)
+        instance = super().__new__(cls, value)
+        instance.namespace = namespace
+        return instance
+
+    def __add__(self, other):
+        if isinstance(other, int):
+            return namespaced_seed(self.namespace, other)
+        return super().__add__(other)
+
+
+GUARD_GATE_SEED_BASE = _NamespacedSeedBase(GUARD_GATE_SEED_NAMESPACE)
+GUARD_PROMOTION_SEED_BASE = _NamespacedSeedBase(GUARD_PROMOTION_SEED_NAMESPACE)
+# Compatibility name for external audit scripts. This set is reserved for
+# canonical best-checkpoint promotion and is never used by the repeated gate.
+GUARD_HOLDOUT_SEED_BASE = GUARD_PROMOTION_SEED_BASE
 
 
 class SoftmaxPolicy:
@@ -90,11 +135,18 @@ class SoftmaxPolicy:
         return [{"action": ACTION_NAMES[index], "prob": round(prob, 3)} for index, prob in rows[:limit]]
 
     def to_json(self) -> dict:
-        return {"obs_dim": self.obs_dim, "action_dim": self.action_dim, "weights": self.weights}
+        return {
+            "obs_dim": self.obs_dim,
+            "action_dim": self.action_dim,
+            "weights": [[float(value) for value in row] for row in self.weights],
+            "rng_state": self.random.getstate(),
+        }
 
-    def clone(self, *, seed: int | None = None) -> "SoftmaxPolicy":
+    def clone(self, *, seed: int | None = None, preserve_rng: bool = False) -> "SoftmaxPolicy":
         policy = SoftmaxPolicy(self.obs_dim, self.action_dim, seed=seed if seed is not None else 17)
         policy.weights = [[float(value) for value in row] for row in self.weights]
+        if preserve_rng:
+            policy.random.setstate(self.random.getstate())
         return policy
 
     def load_json(self, payload: dict) -> None:
@@ -107,6 +159,15 @@ class SoftmaxPolicy:
                     values.extend(0.0 for _ in range(self.obs_dim - len(values)))
                 loaded.append(values)
             self.weights = loaded
+        rng_state = payload.get("rng_state")
+        if isinstance(rng_state, (list, tuple)):
+            self.random.setstate(self._tuple_tree(rng_state))
+
+    @staticmethod
+    def _tuple_tree(value):
+        if isinstance(value, (list, tuple)):
+            return tuple(SoftmaxPolicy._tuple_tree(item) for item in value)
+        return value
 
 
 class RLTrainer:
@@ -125,10 +186,14 @@ class RLTrainer:
         self.red_policy = SoftmaxPolicy(len(obs), len(ACTION_NAMES), seed=13)
         self.lock = threading.RLock()
         self.training_lock = threading.RLock()
+        self.persistence_lock = threading.RLock()
         self.running = False
         self.stop_requested = False
         self.thread: threading.Thread | None = None
         self.episode = 0
+        # Unlike accepted episode count, rollout count is intentionally monotonic.
+        # A rejected guarded batch therefore retries on fresh training matches.
+        self.rollout = 0
         self.baseline = 0.0
         self.learning_rate = 0.0008
         self.gamma = 0.985
@@ -139,10 +204,24 @@ class RLTrainer:
         self.guard_batch_episodes = 20
         self.guard_eval_episodes = 32
         self.guard_accept_margin = 0.0
+        self.guard_min_effect = GUARD_MIN_EFFECT
+        self.guard_min_action_change_rate = 0.001
         self.guard_opponent = "mixed"
         self.best_guard_objective = -math.inf
-        self.coach_enabled = True
-        self.coach_rate = 0.001
+        self.best_guard_context = ""
+        self.guard_in_progress = False
+        self.guard_public_state: dict | None = None
+        # Rejected candidates that have not changed holdout behavior may be
+        # accumulated off-policy across batches. They are never served or saved
+        # as the accepted policy until the complete guard passes.
+        self.staged_policy: SoftmaxPolicy | None = None
+        self.staged_baseline = 0.0
+        self.staged_parent_fingerprint = ""
+        self.staged_batches = 0
+        # Pure reinforcement learning is the default. The optional coach is a
+        # disclosed state-dependent auxiliary loss capped below the RL rate.
+        self.coach_enabled = False
+        self.coach_rate = 0.0001
         self.elo = 1000.0
         self.scripted_elo = 950.0
         self.league_pool: list[dict] = []
@@ -155,14 +234,20 @@ class RLTrainer:
         self.last_event = "ready"
         self._load_checkpoint()
 
-    def train_episode(self, *, persist: bool = True) -> dict:
-        with self.training_lock:
-            return self._train_episode(persist=persist)
+    def train_episode(self, *, persist: bool = False) -> dict:
+        del persist
+        raise RuntimeError(
+            "direct live-policy mutation is disabled; use train_guarded_batch"
+        )
 
-    def _train_episode(self, *, persist: bool = True) -> dict:
+    def _train_episode(self, *, persist: bool = False) -> dict:
+        if persist:
+            raise RuntimeError("candidate episodes cannot persist before guard acceptance")
         with self.lock:
             episode_index = self.episode
             self.episode += 1
+            rollout_index = self.rollout
+            self.rollout += 1
             learning_rate = self.learning_rate
             gamma = self.gamma
             self_play = self.self_play
@@ -170,8 +255,10 @@ class RLTrainer:
             baseline = self.baseline
             coach_enabled = self.coach_enabled
             coach_rate = self.coach_rate
-            opponent = self._select_opponent_locked(episode_index, self_play)
-        env = TacticalSoccerEnv(seed=10_000 + episode_index)
+            opponent = self._select_opponent_locked(rollout_index, self_play)
+        env = TacticalSoccerEnv(
+            seed=namespaced_seed(TRAIN_SEED_NAMESPACE, rollout_index)
+        )
         obs = env.reset()
         trajectory: list[dict] = []
         red_trajectory: list[dict] = []
@@ -197,8 +284,9 @@ class RLTrainer:
             obs = next_obs
 
         new_baseline = self.policy.update(trajectory, learning_rate=learning_rate, gamma=gamma, baseline=baseline)
+        effective_coach_rate = min(coach_rate, learning_rate * 0.25)
         coach_loss = (
-            self.policy.imitate(trajectory, learning_rate=coach_rate, target_action=self._coach_blue)
+            self.policy.imitate(trajectory, learning_rate=effective_coach_rate, target_action=self._coach_blue)
             if coach_enabled
             else 0.0
         )
@@ -210,10 +298,12 @@ class RLTrainer:
         final.update(
             {
                 "episode": episode_index,
+                "rollout": rollout_index,
                 "reward": round(total_reward, 3),
                 "reward_terms": reward_totals,
                 "baseline": round(new_baseline, 3),
                 "coach_loss": round(coach_loss, 4),
+                "coach_effective_rate": round(effective_coach_rate if coach_enabled else 0.0, 7),
                 "result": result,
                 "opponent": self._opponent_public(opponent),
                 "top_actions": self.policy.top_actions(env.observation()),
@@ -228,8 +318,6 @@ class RLTrainer:
             self.history.append(final)
             self.history = self.history[-200:]
             self.last_event = f"episode {episode_index}: {final['result']}"
-        if persist:
-            self._persist(final, env.replay)
         return final
 
     def start(self) -> None:
@@ -255,7 +343,10 @@ class RLTrainer:
             self.policy = SoftmaxPolicy(self.policy.obs_dim, self.policy.action_dim)
             self.red_policy = SoftmaxPolicy(self.red_policy.obs_dim, self.red_policy.action_dim, seed=13)
             self.episode = 0
+            self.rollout = 0
             self.baseline = 0.0
+            self.best_guard_objective = -math.inf
+            self.best_guard_context = ""
             self.elo = 1000.0
             self.scripted_elo = 950.0
             self.league_pool = []
@@ -265,36 +356,83 @@ class RLTrainer:
             self.latest_info = {}
             self.last_eval = {}
             self.last_guard = {}
+            self._clear_staged_candidate_locked()
             self.last_event = "reset"
+            self.guard_in_progress = False
+            self.guard_public_state = None
+        self.best_checkpoint_path.unlink(missing_ok=True)
         self._save_checkpoint()
 
     def update_config(self, payload: dict) -> None:
-        with self.lock:
-            self.learning_rate = max(0.0001, min(0.02, float(payload.get("learning_rate", self.learning_rate))))
-            self.gamma = max(0.8, min(0.999, float(payload.get("gamma", self.gamma))))
-            self.temperature = max(0.25, min(2.5, float(payload.get("temperature", self.temperature))))
-            self.self_play = bool(payload.get("self_play", self.self_play))
-            self.league_enabled = bool(payload.get("league_enabled", self.league_enabled))
-            self.guard_enabled = bool(payload.get("guard_enabled", self.guard_enabled))
-            self.guard_batch_episodes = max(1, min(100, int(payload.get("guard_batch_episodes", self.guard_batch_episodes))))
-            self.guard_eval_episodes = max(4, min(120, int(payload.get("guard_eval_episodes", self.guard_eval_episodes))))
-            self.guard_accept_margin = max(-10.0, min(25.0, float(payload.get("guard_accept_margin", self.guard_accept_margin))))
-            guard_opponent = str(payload.get("guard_opponent", self.guard_opponent) or self.guard_opponent)
-            self.guard_opponent = guard_opponent if guard_opponent in {"mixed", "scripted", "current_red", "league"} else "mixed"
-            self.coach_enabled = bool(payload.get("coach_enabled", self.coach_enabled))
-            self.coach_rate = max(0.0, min(0.05, float(payload.get("coach_rate", self.coach_rate))))
-            self.last_event = "settings updated"
+        # Configuration changes are transactional with training. In particular,
+        # this prevents an API request from checkpointing the temporary candidate
+        # while a guarded batch is still awaiting acceptance.
+        with self.training_lock:
+            with self.lock:
+                before = self._config_payload_locked()
+                self.learning_rate = max(0.0001, min(0.02, float(payload.get("learning_rate", self.learning_rate))))
+                self.gamma = max(0.8, min(0.999, float(payload.get("gamma", self.gamma))))
+                self.temperature = max(0.25, min(2.5, float(payload.get("temperature", self.temperature))))
+                self.self_play = bool(payload.get("self_play", self.self_play))
+                self.league_enabled = bool(payload.get("league_enabled", self.league_enabled))
+                if payload.get("guard_enabled") is False:
+                    raise ValueError(
+                        "guard_enabled cannot be disabled when only verified policies may be served"
+                    )
+                self.guard_enabled = True
+                self.guard_batch_episodes = max(1, min(100, int(payload.get("guard_batch_episodes", self.guard_batch_episodes))))
+                self.guard_eval_episodes = max(32, min(120, int(payload.get("guard_eval_episodes", self.guard_eval_episodes))))
+                self.guard_accept_margin = max(0.0, min(25.0, float(payload.get("guard_accept_margin", self.guard_accept_margin))))
+                self.guard_min_effect = max(
+                    GUARD_MIN_EFFECT,
+                    min(25.0, float(payload.get("guard_min_effect", self.guard_min_effect))),
+                )
+                self.guard_min_action_change_rate = max(
+                    0.0,
+                    min(1.0, float(payload.get("guard_min_action_change_rate", self.guard_min_action_change_rate))),
+                )
+                guard_opponent = str(payload.get("guard_opponent", self.guard_opponent) or self.guard_opponent)
+                self.guard_opponent = guard_opponent if guard_opponent in {"mixed", "scripted", "current_red", "league"} else "mixed"
+                self.coach_enabled = bool(payload.get("coach_enabled", self.coach_enabled))
+                self.coach_rate = max(0.0, min(0.005, float(payload.get("coach_rate", self.coach_rate))))
+                if self._config_payload_locked() != before:
+                    self._clear_staged_candidate_locked()
+                self.last_event = "settings updated"
+            self._save_checkpoint()
 
     def snapshot(self) -> dict:
         with self.lock:
-            played = len(self.history)
-            wins = sum(1 for row in self.history if row.get("result") == "win")
-            losses = sum(1 for row in self.history if row.get("result") == "loss")
-            draws = sum(1 for row in self.history if row.get("result") == "draw")
+            public = self.guard_public_state if self.guard_in_progress else None
+            history = list(public["history"]) if public is not None else self.history
+            latest = dict(public["latest_info"]) if public is not None else dict(self.latest_info)
+            last_eval = dict(public["last_eval"]) if public is not None else dict(self.last_eval)
+            last_guard = dict(public["last_guard"]) if public is not None else dict(self.last_guard)
+            league_pool = public["league_pool"] if public is not None else self.league_pool
+            elo = float(public["elo"]) if public is not None else self.elo
+            scripted_elo = (
+                float(public["scripted_elo"])
+                if public is not None
+                else self.scripted_elo
+            )
+            last_opponent = (
+                dict(public["last_opponent"])
+                if public is not None
+                else dict(self.last_opponent)
+            )
+            played = len(history)
+            wins = sum(1 for row in history if row.get("result") == "win")
+            losses = sum(1 for row in history if row.get("result") == "loss")
+            draws = sum(1 for row in history if row.get("result") == "draw")
             return {
                 "running": self.running,
-                "episode": self.episode,
-                "last_event": self.last_event,
+                "guard_in_progress": self.guard_in_progress,
+                "episode": int(public["episode"]) if public is not None else self.episode,
+                "rollout": self.rollout,
+                "last_event": (
+                    "guard evaluating private candidate; serving last accepted state"
+                    if public is not None
+                    else self.last_event
+                ),
                 "config": {
                     "learning_rate": self.learning_rate,
                     "gamma": self.gamma,
@@ -305,16 +443,26 @@ class RLTrainer:
                     "guard_batch_episodes": self.guard_batch_episodes,
                     "guard_eval_episodes": self.guard_eval_episodes,
                     "guard_accept_margin": self.guard_accept_margin,
+                    "guard_min_effect": self.guard_min_effect,
+                    "guard_min_action_change_rate": self.guard_min_action_change_rate,
                     "guard_opponent": self.guard_opponent,
                     "coach_enabled": self.coach_enabled,
                     "coach_rate": self.coach_rate,
+                    "coach_effective_rate": min(self.coach_rate, self.learning_rate * 0.25) if self.coach_enabled else 0.0,
+                    "coach_mode": "state_dependent_auxiliary" if self.coach_enabled else "off_pure_rl",
                 },
-                "guard": dict(self.last_guard),
+                "guard": last_guard,
+                "staged_candidate": {
+                    "active": self.staged_policy is not None,
+                    "batches": self.staged_batches,
+                    "parent_policy": self.staged_parent_fingerprint,
+                    "served": False,
+                },
                 "league": {
-                    "elo": round(self.elo, 1),
-                    "scripted_elo": round(self.scripted_elo, 1),
-                    "pool_size": len(self.league_pool),
-                    "last_opponent": dict(self.last_opponent),
+                    "elo": round(elo, 1),
+                    "scripted_elo": round(scripted_elo, 1),
+                    "pool_size": len(league_pool),
+                    "last_opponent": last_opponent,
                     "pool": [
                         {
                             "id": row["id"],
@@ -325,98 +473,328 @@ class RLTrainer:
                             "losses": row.get("losses", 0),
                             "draws": row.get("draws", 0),
                         }
-                        for row in self.league_pool[-6:]
+                        for row in league_pool[-6:]
                     ],
                 },
                 "record": {"wins": wins, "losses": losses, "draws": draws, "played": played, "win_rate": round(wins / played, 3) if played else 0.0},
-                "latest": dict(self.latest_info),
-                "history": self.history[-80:],
-                "evaluation": dict(self.last_eval),
+                "latest": latest,
+                "history": history[-80:],
+                "evaluation": last_eval,
                 "checkpoint": str(self.checkpoint_path),
                 "best_checkpoint": str(self.best_checkpoint_path),
-                "replay_frames": len(self.latest_replay),
+                "replay_frames": (
+                    len(public["latest_replay"])
+                    if public is not None
+                    else len(self.latest_replay)
+                ),
             }
 
     def latest_replay_payload(self) -> dict:
         with self.lock:
+            if self.guard_in_progress and self.guard_public_state is not None:
+                return {
+                    "frames": list(self.guard_public_state["latest_replay"]),
+                    "latest": dict(self.guard_public_state["latest_info"]),
+                }
             return {"frames": list(self.latest_replay), "latest": dict(self.latest_info)}
+
+    def _clear_staged_candidate_locked(self) -> None:
+        self.staged_policy = None
+        self.staged_baseline = 0.0
+        self.staged_parent_fingerprint = ""
+        self.staged_batches = 0
 
     def train_guarded_batch(self, episodes: int, *, eval_episodes: int | None = None, accept_margin: float | None = None) -> dict:
         with self.training_lock:
-            return self._train_guarded_batch(episodes, eval_episodes=eval_episodes, accept_margin=accept_margin)
+            with self.lock:
+                if self.guard_in_progress:
+                    raise RuntimeError("a guarded training transaction is already active")
+                original = self._capture_state_locked()
+                self.guard_in_progress = True
+                self.guard_public_state = original
+            try:
+                return self._train_guarded_batch(
+                    episodes,
+                    eval_episodes=eval_episodes,
+                    accept_margin=accept_margin,
+                    original=original,
+                )
+            except Exception:
+                # No exception path may leave an unaccepted candidate live or
+                # make it eligible for a later checkpoint/close operation.
+                with self.lock:
+                    self._restore_state_locked(original)
+                    self.guard_in_progress = False
+                    self.guard_public_state = None
+                    self.last_event = "guard transaction failed; accepted state restored"
+                self._save_checkpoint()
+                raise
 
-    def _train_guarded_batch(self, episodes: int, *, eval_episodes: int | None = None, accept_margin: float | None = None) -> dict:
+    def _train_guarded_batch(
+        self,
+        episodes: int,
+        *,
+        eval_episodes: int | None = None,
+        accept_margin: float | None = None,
+        original: dict,
+    ) -> dict:
         episodes = max(1, min(250, int(episodes)))
-        eval_episodes = max(4, min(120, int(eval_episodes if eval_episodes is not None else self.guard_eval_episodes)))
-        accept_margin = float(self.guard_accept_margin if accept_margin is None else accept_margin)
+        eval_episodes = max(32, min(120, int(eval_episodes if eval_episodes is not None else self.guard_eval_episodes)))
+        accept_margin = max(0.0, float(self.guard_accept_margin if accept_margin is None else accept_margin))
         with self.lock:
-            original = self._capture_state_locked()
-            start_episode = self.episode
-            seeds = [830_000 + start_episode * 37 + index for index in range(eval_episodes)]
+            parent_fingerprint = self._policy_fingerprint(original["policy"])
+            staged_used = (
+                self.staged_policy is not None
+                and self.staged_parent_fingerprint == parent_fingerprint
+            )
+            prior_staged_batches = self.staged_batches if staged_used else 0
+            if staged_used:
+                staged_start_policy = self.staged_policy.clone(preserve_rng=True)
+                staged_start_baseline = self.staged_baseline
+            elif self.staged_policy is not None:
+                self._clear_staged_candidate_locked()
+            # Every proposal receives fresh, deterministic paired validation
+            # matches. Rejected proposals therefore cannot adapt to a repeatedly
+            # reused validation set.
+            gate_seed_offset = int(self.rollout) * GUARD_GATE_SEED_STRIDE
+            seeds = [
+                namespaced_seed(GUARD_GATE_SEED_NAMESPACE, gate_seed_offset + index)
+                for index in range(eval_episodes)
+            ]
+            gate_seed_base = seeds[0]
             guard_opponent = self.guard_opponent
+            required_effect = max(
+                GUARD_MIN_EFFECT, self.guard_min_effect, accept_margin
+            )
+            min_action_change_rate = self.guard_min_action_change_rate
+            frozen_red = original["red_policy"]
+            frozen_pool = original["league_pool"]
+            frozen_schedule = self._build_evaluation_schedule(guard_opponent, eval_episodes, frozen_pool)
+            eval_context = self._evaluation_context(frozen_red, frozen_pool, frozen_schedule, seeds)
         baseline = self._evaluate_policy(
             original["policy"],
-            original["red_policy"],
-            original["league_pool"],
+            frozen_red,
+            frozen_pool,
             seeds,
             opponent=guard_opponent,
+            opponent_schedule=frozen_schedule,
+            capture_observations=True,
+            evaluation_context=eval_context,
         )
+        holdout_observations = baseline.pop("_observations", [])
+        if staged_used:
+            with self.lock:
+                self.policy = staged_start_policy
+                self.baseline = staged_start_baseline
         latest = None
         for _ in range(episodes):
-            latest = self.train_episode(persist=False)
+            latest = self._train_episode(persist=False)
         with self.lock:
-            candidate_policy = self.policy.clone(seed=71)
-            candidate_red = self.red_policy.clone(seed=73)
-            candidate_pool = self._clone_league_pool_locked()
+            candidate_policy = self.policy.clone(preserve_rng=True)
+            candidate_baseline = self.baseline
             candidate_replay = list(self.latest_replay)
             candidate_latest = dict(self.latest_info)
-        candidate = self._evaluate_policy(candidate_policy, candidate_red, candidate_pool, seeds, opponent=guard_opponent)
+        # Only the candidate blue policy differs. Red, league snapshots, seeds,
+        # and the per-episode opponent schedule are the exact same frozen objects.
+        candidate = self._evaluate_policy(
+            candidate_policy,
+            frozen_red,
+            frozen_pool,
+            seeds,
+            opponent=guard_opponent,
+            opponent_schedule=frozen_schedule,
+            evaluation_context=eval_context,
+        )
         baseline_objective = self._guard_objective(baseline)
         candidate_objective = self._guard_objective(candidate)
-        accepted = candidate_objective >= baseline_objective + accept_margin
+        objective_delta = candidate_objective - baseline_objective
+        behavior = self._holdout_behavior_change(original["policy"], candidate_policy, holdout_observations)
+        baseline_match_points = self._match_points(baseline)
+        candidate_match_points = self._match_points(candidate)
+        outcome_non_regression = candidate_match_points + 1e-12 >= baseline_match_points
+        rejection_reasons = []
+        no_material_action_change = (
+            behavior["changed_actions"] <= 0
+            or behavior["change_rate"] + 1e-12 < min_action_change_rate
+        )
+        if no_material_action_change:
+            rejection_reasons.append("no_material_action_change_on_holdout_states")
+        else:
+            if objective_delta + 1e-12 < required_effect:
+                rejection_reasons.append("holdout_effect_below_minimum")
+            if not outcome_non_regression:
+                rejection_reasons.append("match_points_regressed")
+        gate_accepted = not rejection_reasons
+        promotion = {
+            "evaluated": False,
+            "promoted": False,
+            "context_version": GUARD_PROMOTION_CONTEXT_VERSION,
+        }
+        if gate_accepted:
+            promotion_baseline = self._evaluate_promotion_policy(original["policy"])
+            promotion_candidate = self._evaluate_promotion_policy(candidate_policy)
+            promotion_baseline_objective = self._guard_objective(promotion_baseline)
+            promotion_candidate_objective = self._guard_objective(promotion_candidate)
+            promotion_delta = promotion_candidate_objective - promotion_baseline_objective
+            promotion_baseline_points = self._match_points(promotion_baseline)
+            promotion_candidate_points = self._match_points(promotion_candidate)
+            promotion_outcome_non_regression = (
+                promotion_candidate_points + 1e-12 >= promotion_baseline_points
+            )
+            promotion_context = dict(promotion_candidate["evaluation_context"])
+            promotion_context_id = str(promotion_context["context_id"])
+            with self.lock:
+                historical_best = self.best_guard_objective
+                historical_context = self.best_guard_context
+            comparable_history = (
+                not math.isfinite(historical_best)
+                or historical_context == promotion_context_id
+            )
+            beats_current = (
+                promotion_delta + 1e-12 >= required_effect
+                and promotion_outcome_non_regression
+            )
+            beats_historical_best = (
+                not math.isfinite(historical_best)
+                or promotion_candidate_objective > historical_best + 1e-12
+            )
+            if not beats_current:
+                rejection_reasons.append(
+                    "canonical_holdout_did_not_confirm_improvement"
+                )
+            if not comparable_history:
+                rejection_reasons.append("canonical_history_context_incomparable")
+            promoted = bool(
+                beats_current and comparable_history and beats_historical_best
+            )
+            promotion = {
+                "evaluated": True,
+                "promoted": promoted,
+                "context_version": GUARD_PROMOTION_CONTEXT_VERSION,
+                "context_id": promotion_context_id,
+                "seed_base": GUARD_PROMOTION_SEED_BASE,
+                "episodes": GUARD_PROMOTION_EPISODES,
+                "baseline_objective": round(promotion_baseline_objective, 3),
+                "candidate_objective": round(promotion_candidate_objective, 3),
+                "objective_delta": round(promotion_delta, 3),
+                "baseline_match_points": round(promotion_baseline_points, 4),
+                "candidate_match_points": round(promotion_candidate_points, 4),
+                "outcome_non_regression": promotion_outcome_non_regression,
+                "historical_best_objective": (
+                    None if not math.isfinite(historical_best) else round(historical_best, 3)
+                ),
+                "historical_context": historical_context or None,
+                "comparable_history": comparable_history,
+                "beats_current": beats_current,
+                "beats_historical_best": beats_historical_best,
+                "evaluation_context": promotion_context,
+                "baseline": self._evaluation_summary(promotion_baseline),
+                "candidate": self._evaluation_summary(promotion_candidate),
+            }
+        accepted = not rejection_reasons
+        if not accepted:
+            promotion["promoted"] = False
         guard = {
             "accepted": accepted,
             "episodes": episodes,
             "eval_episodes": eval_episodes,
+            "gate_rotating": True,
+            "gate_seed_base": gate_seed_base,
+            "holdout_fixed": False,
+            "started_from_staged_candidate": staged_used,
+            "staged_batches_in_candidate": prior_staged_batches + 1,
             "opponent": guard_opponent,
             "opponent_distribution": candidate.get("opponent_distribution", {}),
             "accept_margin": round(accept_margin, 3),
+            "min_effect": round(required_effect, 3),
+            "min_action_change_rate": round(min_action_change_rate, 6),
             "baseline_objective": round(baseline_objective, 3),
             "candidate_objective": round(candidate_objective, 3),
+            "objective_delta": round(objective_delta, 3),
             "baseline_reward": baseline["avg_reward"],
             "candidate_reward": candidate["avg_reward"],
             "baseline_goal_diff": baseline["avg_goal_diff"],
             "candidate_goal_diff": candidate["avg_goal_diff"],
             "baseline_win_rate": baseline["record"]["win_rate"],
             "candidate_win_rate": candidate["record"]["win_rate"],
+            "baseline_match_points": round(baseline_match_points, 4),
+            "candidate_match_points": round(candidate_match_points, 4),
+            "outcome_non_regression": outcome_non_regression,
+            "behavior": behavior,
+            "evaluation_context": eval_context,
+            "rejection_reasons": rejection_reasons,
             "reward_audit": self._reward_audit(candidate),
+            "promotion": promotion,
         }
         with self.lock:
             if accepted:
+                self._clear_staged_candidate_locked()
                 self.last_eval = candidate
                 self.last_guard = guard
                 if latest is None:
                     latest = candidate_latest
                 latest["guard"] = guard
                 self.last_event = f"guard accepted {episodes}: {baseline_objective:.2f} -> {candidate_objective:.2f}"
-                self._save_best_checkpoint(candidate_objective)
-                self._persist(latest, candidate_replay)
+                self.guard_in_progress = False
+                self.guard_public_state = None
+                best_payload = None
+                if promotion.get("promoted"):
+                    best_payload = self._prepare_best_checkpoint(
+                        promotion_candidate_objective,
+                        context=dict(promotion["evaluation_context"]),
+                        evaluation=dict(promotion["candidate"]),
+                    )
+                # The authoritative main checkpoint is committed first and
+                # already contains the canonical best metadata. A failure can
+                # therefore never make an unaccepted candidate authoritative.
+                self._save_checkpoint()
+                if best_payload is not None:
+                    try:
+                        self._write_best_checkpoint(best_payload)
+                    except OSError as exc:
+                        # Keep the verified current policy, but do not advance a
+                        # best threshold whose artifact was not durably written.
+                        self.best_guard_objective = original["best_guard_objective"]
+                        self.best_guard_context = original["best_guard_context"]
+                        promotion["promoted"] = False
+                        promotion["promotion_error"] = repr(exc)
+                        self._save_checkpoint()
+                        self.last_event += "; best promotion artifact failed"
+                try:
+                    self._persist_artifacts(latest, candidate_replay)
+                except OSError as exc:
+                    # Main policy is already atomically committed and verified;
+                    # an ancillary replay/metrics failure must not roll it back.
+                    self.last_event += f"; audit artifact failed: {exc!r}"
             else:
                 self._restore_state_locked(original)
+                if rejection_reasons == [
+                    "no_material_action_change_on_holdout_states"
+                ]:
+                    self.staged_policy = candidate_policy.clone(preserve_rng=True)
+                    self.staged_baseline = candidate_baseline
+                    self.staged_parent_fingerprint = parent_fingerprint
+                    self.staged_batches = prior_staged_batches + 1
+                else:
+                    self._clear_staged_candidate_locked()
                 self.last_guard = guard
-                self.last_event = f"guard rejected {episodes}: {candidate_objective:.2f} < {baseline_objective:.2f}"
+                self.guard_in_progress = False
+                self.guard_public_state = None
+                reason = ", ".join(rejection_reasons)
+                staged_note = f"; staged {self.staged_batches}" if self.staged_policy is not None else ""
+                self.last_event = f"guard rejected {episodes}: {objective_delta:+.2f}; {reason}{staged_note}"
                 self._save_checkpoint()
         return {"accepted": accepted, "guard": guard, "baseline": baseline, "candidate": candidate, "latest": latest or {}}
 
     def _capture_state_locked(self) -> dict:
         return {
-            "policy": self.policy.clone(seed=61),
-            "red_policy": self.red_policy.clone(seed=63),
+            "policy": self.policy.clone(seed=61, preserve_rng=True),
+            "red_policy": self.red_policy.clone(seed=63, preserve_rng=True),
             "episode": self.episode,
             "baseline": self.baseline,
             "elo": self.elo,
             "scripted_elo": self.scripted_elo,
-            "league_pool": self._clone_league_pool_locked(),
+            "league_pool": self._clone_league_pool_locked(preserve_rng=True),
             "last_opponent": dict(self.last_opponent),
             "history": list(self.history),
             "latest_replay": list(self.latest_replay),
@@ -424,6 +802,16 @@ class RLTrainer:
             "last_eval": dict(self.last_eval),
             "last_guard": dict(self.last_guard),
             "last_event": self.last_event,
+            "best_guard_objective": self.best_guard_objective,
+            "best_guard_context": self.best_guard_context,
+            "staged_policy": (
+                self.staged_policy.clone(preserve_rng=True)
+                if self.staged_policy is not None
+                else None
+            ),
+            "staged_baseline": self.staged_baseline,
+            "staged_parent_fingerprint": self.staged_parent_fingerprint,
+            "staged_batches": self.staged_batches,
         }
 
     def _restore_state_locked(self, state: dict) -> None:
@@ -441,8 +829,14 @@ class RLTrainer:
         self.last_eval = dict(state["last_eval"])
         self.last_guard = dict(state["last_guard"])
         self.last_event = state["last_event"]
+        self.best_guard_objective = state["best_guard_objective"]
+        self.best_guard_context = state["best_guard_context"]
+        self.staged_policy = state["staged_policy"]
+        self.staged_baseline = state["staged_baseline"]
+        self.staged_parent_fingerprint = state["staged_parent_fingerprint"]
+        self.staged_batches = state["staged_batches"]
 
-    def _clone_league_pool_locked(self) -> list[dict]:
+    def _clone_league_pool_locked(self, *, preserve_rng: bool = False) -> list[dict]:
         return [
             {
                 "id": row["id"],
@@ -452,7 +846,7 @@ class RLTrainer:
                 "wins": row.get("wins", 0),
                 "losses": row.get("losses", 0),
                 "draws": row.get("draws", 0),
-                "policy": row["policy"].clone(seed=81 + index),
+                "policy": row["policy"].clone(seed=81 + index, preserve_rng=preserve_rng),
             }
             for index, row in enumerate(self.league_pool)
         ]
@@ -460,13 +854,22 @@ class RLTrainer:
     @staticmethod
     def _guard_objective(evaluation: dict) -> float:
         record = evaluation.get("record", {})
+        win_rate = float(record.get("win_rate", 0.0))
+        loss_rate = float(record.get("loss_rate", 0.0))
+        match_points = win_rate + (1.0 - win_rate - loss_rate) * 0.5
         return (
-            float(evaluation.get("avg_reward", 0.0))
-            + float(evaluation.get("avg_goal_diff", 0.0)) * 6.0
+            match_points * 100.0
+            + float(evaluation.get("avg_goal_diff", 0.0)) * 10.0
             + float(evaluation.get("avg_xg_diff", 0.0)) * 3.0
-            + float(record.get("win_rate", 0.0)) * 2.0
-            - float(record.get("loss_rate", 0.0)) * 2.0
+            + float(evaluation.get("avg_reward", 0.0)) * 0.25
         )
+
+    @staticmethod
+    def _match_points(evaluation: dict) -> float:
+        record = evaluation.get("record", {})
+        win_rate = float(record.get("win_rate", 0.0))
+        loss_rate = float(record.get("loss_rate", 0.0))
+        return win_rate + max(0.0, 1.0 - win_rate - loss_rate) * 0.5
 
     @staticmethod
     def _reward_audit(evaluation: dict) -> dict:
@@ -483,28 +886,154 @@ class RLTrainer:
             warnings.append("objective improved while goal differential is negative; inspect shaping terms")
         return {"term_abs_share": shares, "warnings": warnings}
 
+    @staticmethod
+    def _policy_fingerprint(policy: SoftmaxPolicy) -> str:
+        raw = json.dumps(policy.weights, separators=(",", ":"), sort_keys=False).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:16]
+
+    def _evaluation_context(
+        self,
+        red_policy: SoftmaxPolicy,
+        pool: list[dict],
+        schedule: list[dict],
+        seeds: list[int | str],
+    ) -> dict:
+        pool_payload = [
+            {
+                "id": row.get("id"),
+                "policy": self._policy_fingerprint(row["policy"]),
+            }
+            for row in pool
+        ]
+        schedule_payload = [
+            {
+                "kind": row.get("kind", "scripted"),
+                "id": row.get("id"),
+                "name": row.get("name", "scripted red"),
+            }
+            for row in schedule
+        ]
+        pool_raw = json.dumps(pool_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        schedule_raw = json.dumps(schedule_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return {
+            "red_policy": self._policy_fingerprint(red_policy),
+            "league_pool": hashlib.sha256(pool_raw).hexdigest()[:16],
+            "opponent_schedule": hashlib.sha256(schedule_raw).hexdigest()[:16],
+            "schedule": schedule_payload,
+            "seed_first": seeds[0] if seeds else None,
+            "seed_last": seeds[-1] if seeds else None,
+            "seed_count": len(seeds),
+        }
+
+    def _evaluate_promotion_policy(self, policy: SoftmaxPolicy) -> dict:
+        """Evaluate against the immutable context used only for best promotion."""
+
+        canonical_red, canonical_pool, seeds, schedule, context = (
+            self._promotion_evaluation_setup(policy)
+        )
+        return self._evaluate_policy(
+            policy,
+            canonical_red,
+            canonical_pool,
+            seeds,
+            opponent="mixed",
+            opponent_schedule=schedule,
+            evaluation_context=context,
+        )
+
+    def _promotion_evaluation_setup(self, policy: SoftmaxPolicy):
+        canonical_red = SoftmaxPolicy(policy.obs_dim, policy.action_dim, seed=20260712)
+        canonical_pool: list[dict] = []
+        seeds = [
+            namespaced_seed(GUARD_PROMOTION_SEED_NAMESPACE, index)
+            for index in range(GUARD_PROMOTION_EPISODES)
+        ]
+        schedule = self._build_evaluation_schedule(
+            "mixed", GUARD_PROMOTION_EPISODES, canonical_pool
+        )
+        context = self._evaluation_context(
+            canonical_red, canonical_pool, schedule, seeds
+        )
+        context.update(
+            {
+                "purpose": "canonical_best_promotion_only",
+                "context_version": GUARD_PROMOTION_CONTEXT_VERSION,
+            }
+        )
+        context_raw = json.dumps(
+            context, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        context["context_id"] = hashlib.sha256(context_raw).hexdigest()[:16]
+        return canonical_red, canonical_pool, seeds, schedule, context
+
+    def _evaluation_summary(self, evaluation: dict) -> dict:
+        return {
+            "episodes": int(evaluation.get("episodes", 0)),
+            "record": dict(evaluation.get("record") or {}),
+            "avg_reward": float(evaluation.get("avg_reward", 0.0)),
+            "avg_goal_diff": float(evaluation.get("avg_goal_diff", 0.0)),
+            "avg_xg_diff": float(evaluation.get("avg_xg_diff", 0.0)),
+            "objective": round(self._guard_objective(evaluation), 3),
+            "evaluation_context": dict(evaluation.get("evaluation_context") or {}),
+        }
+
+    @staticmethod
+    def _holdout_behavior_change(
+        baseline_policy: SoftmaxPolicy,
+        candidate_policy: SoftmaxPolicy,
+        observations: list[list[float]],
+    ) -> dict:
+        baseline_actions = [baseline_policy.greedy(obs) for obs in observations]
+        candidate_actions = [candidate_policy.greedy(obs) for obs in observations]
+        changed = sum(1 for left, right in zip(baseline_actions, candidate_actions) if left != right)
+        total = len(baseline_actions)
+        baseline_digest = hashlib.sha256(bytes(baseline_actions)).hexdigest()[:16]
+        candidate_digest = hashlib.sha256(bytes(candidate_actions)).hexdigest()[:16]
+        return {
+            "probe_states": total,
+            "changed_actions": changed,
+            "change_rate": round(changed / total, 6) if total else 0.0,
+            "baseline_action_digest": baseline_digest,
+            "candidate_action_digest": candidate_digest,
+        }
+
+    def _build_evaluation_schedule(self, opponent: str, episodes: int, pool: list[dict]) -> list[dict]:
+        return [self._evaluation_opponent(opponent, index, pool) for index in range(episodes)]
+
     def _evaluate_policy(
         self,
         blue_policy: SoftmaxPolicy,
         red_policy: SoftmaxPolicy,
         pool: list[dict],
-        seeds: list[int],
+        seeds: list[int | str],
         *,
         opponent: str = "mixed",
+        opponent_schedule: list[dict] | None = None,
+        capture_observations: bool = False,
+        evaluation_context: dict | None = None,
     ) -> dict:
+        if opponent_schedule is not None and len(opponent_schedule) != len(seeds):
+            raise ValueError("opponent schedule must have exactly one frozen entry per evaluation seed")
         rows = []
+        observations: list[list[float]] = []
         reward_totals: dict[str, float] = {}
         opponent_distribution = {"scripted": 0, "current_red": 0, "league": 0}
         latest_replay: list[dict] = []
         for index, seed in enumerate(seeds):
             env = TacticalSoccerEnv(seed=seed)
             obs = env.reset()
-            selected = self._evaluation_opponent(opponent, index, pool)
+            selected = (
+                opponent_schedule[index]
+                if opponent_schedule is not None
+                else self._evaluation_opponent(opponent, index, pool)
+            )
             opponent_distribution[selected["kind"]] = opponent_distribution.get(selected["kind"], 0) + 1
             total_reward = 0.0
             done = False
             latest_info = {}
             while not done:
+                if capture_observations:
+                    observations.append(list(obs))
                 blue_action = blue_policy.greedy(obs)
                 if selected["kind"] == "current_red":
                     red_action = red_policy.greedy(self._invert_obs(obs))
@@ -535,25 +1064,29 @@ class RLTrainer:
         goal_diff = sum(row["score"]["blue"] - row["score"]["red"] for row in rows) / episodes
         xg_diff = sum(row["xg"]["blue"] - row["xg"]["red"] for row in rows) / episodes
         avg_reward = sum(row["reward"] for row in rows) / episodes
-        return {
+        result = {
             "episodes": episodes,
             "opponent": opponent,
             "record": {
                 "wins": wins,
                 "losses": losses,
                 "draws": draws,
-                "win_rate": round(wins / episodes, 3),
-                "loss_rate": round(losses / episodes, 3),
+                "win_rate": wins / episodes,
+                "loss_rate": losses / episodes,
             },
             "avg_reward": round(avg_reward, 3),
             "avg_goal_diff": round(goal_diff, 3),
             "avg_xg_diff": round(xg_diff, 3),
             "avg_reward_terms": {key: round(value / episodes, 3) for key, value in sorted(reward_totals.items())},
             "opponent_distribution": opponent_distribution,
+            "evaluation_context": dict(evaluation_context or {}),
             "latest": rows[-1] if rows else {},
             "rows": rows[-40:],
             "replay_frames": len(latest_replay),
         }
+        if capture_observations:
+            result["_observations"] = observations
+        return result
 
     def evaluate(self, episodes: int = 20, opponent: str = "mixed") -> dict:
         with self.training_lock:
@@ -568,7 +1101,17 @@ class RLTrainer:
             pool = self._clone_league_pool_locked()
             start_episode = self.episode
         seeds = [700_000 + start_episode + index for index in range(episodes)]
-        evaluation = self._evaluate_policy(blue_policy, red_policy, pool, seeds, opponent=opponent)
+        schedule = self._build_evaluation_schedule(opponent, episodes, pool)
+        context = self._evaluation_context(red_policy, pool, schedule, seeds)
+        evaluation = self._evaluate_policy(
+            blue_policy,
+            red_policy,
+            pool,
+            seeds,
+            opponent=opponent,
+            opponent_schedule=schedule,
+            evaluation_context=context,
+        )
         with self.lock:
             self.last_eval = evaluation
             self.last_event = f"evaluated {episodes} vs {opponent}"
@@ -579,7 +1122,21 @@ class RLTrainer:
         with self.lock:
             self.stop_requested = True
             self.running = False
-        self._save_checkpoint()
+            active_thread = self.thread
+        # Wait for the active transaction to accept or roll back before saving.
+        # The worker is daemonized only for process safety; close itself is a
+        # synchronous durability boundary.
+        with self.training_lock:
+            self._save_checkpoint()
+        if (
+            active_thread is not None
+            and active_thread is not threading.current_thread()
+            and active_thread.is_alive()
+        ):
+            active_thread.join()
+        with self.lock:
+            if self.thread is active_thread:
+                self.thread = None
 
     def _loop(self) -> None:
         while True:
@@ -595,63 +1152,162 @@ class RLTrainer:
                 batch_episodes = self.guard_batch_episodes
                 eval_episodes = self.guard_eval_episodes
                 accept_margin = self.guard_accept_margin
-            if guarded:
-                self.train_guarded_batch(batch_episodes, eval_episodes=eval_episodes, accept_margin=accept_margin)
-            else:
-                self.train_episode()
+            try:
+                if guarded:
+                    self.train_guarded_batch(
+                        batch_episodes,
+                        eval_episodes=eval_episodes,
+                        accept_margin=accept_margin,
+                    )
+                else:
+                    with self.lock:
+                        self._clear_staged_candidate_locked()
+                        self.running = False
+                        self.last_event = "training stopped: acceptance guard is required"
+            except Exception as exc:
+                with self.lock:
+                    self.running = False
+                    self.last_event = f"training error: {exc!r}"
+                return
             time.sleep(0.01)
 
     def _persist(self, metrics: dict, replay: list[dict]) -> None:
         self._save_checkpoint()
-        self.replay_path.write_text(json.dumps({"latest": metrics, "frames": replay}, ensure_ascii=False, indent=2), encoding="utf-8")
-        with self.metrics_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(metrics, ensure_ascii=False, sort_keys=True) + "\n")
+        self._persist_artifacts(metrics, replay)
 
-    def _save_checkpoint(self) -> None:
-        payload = {
-            "episode": self.episode,
-            "baseline": self.baseline,
-            "elo": self.elo,
-            "scripted_elo": self.scripted_elo,
+    def _persist_artifacts(self, metrics: dict, replay: list[dict]) -> None:
+        with self.persistence_lock:
+            self._atomic_write_json(
+                self.replay_path,
+                {"latest": metrics, "frames": replay},
+                ensure_ascii=False,
+            )
+            with self.metrics_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(metrics, ensure_ascii=False, sort_keys=True) + "\n")
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: dict, *, ensure_ascii: bool = True) -> None:
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(payload, ensure_ascii=ensure_ascii, indent=2)
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            except (AttributeError, OSError):
+                directory_fd = None
+            if directory_fd is not None:
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _config_payload_locked(self) -> dict:
+        return {
+            "learning_rate": self.learning_rate,
+            "gamma": self.gamma,
+            "temperature": self.temperature,
+            "self_play": self.self_play,
             "league_enabled": self.league_enabled,
             "guard_enabled": self.guard_enabled,
             "guard_batch_episodes": self.guard_batch_episodes,
             "guard_eval_episodes": self.guard_eval_episodes,
             "guard_accept_margin": self.guard_accept_margin,
+            "guard_min_effect": self.guard_min_effect,
+            "guard_min_action_change_rate": self.guard_min_action_change_rate,
             "guard_opponent": self.guard_opponent,
-            "best_guard_objective": None if not math.isfinite(self.best_guard_objective) else self.best_guard_objective,
             "coach_enabled": self.coach_enabled,
             "coach_rate": self.coach_rate,
-            "policy": self.policy.to_json(),
-            "red_policy": self.red_policy.to_json(),
-            "league_pool": [
-                {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "elo": row["elo"],
-                    "games": row.get("games", 0),
-                    "wins": row.get("wins", 0),
-                    "losses": row.get("losses", 0),
-                    "draws": row.get("draws", 0),
-                    "policy": row["policy"].to_json(),
-                }
-                for row in self.league_pool
-            ],
         }
-        self.checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    def _save_best_checkpoint(self, objective: float) -> None:
-        if objective < self.best_guard_objective:
-            return
+    def _save_checkpoint(self) -> None:
+        with self.lock:
+            if self.guard_in_progress:
+                raise RuntimeError(
+                    "refusing to checkpoint an unaccepted guarded candidate"
+                )
+            has_best = math.isfinite(self.best_guard_objective)
+            if has_best != bool(self.best_guard_context):
+                raise ValueError("canonical best metadata is incomplete")
+            if has_best:
+                expected_context = self._promotion_evaluation_setup(self.policy)[4][
+                    "context_id"
+                ]
+                if self.best_guard_context != expected_context:
+                    raise ValueError("canonical best context is not comparable")
+            config = self._config_payload_locked()
+            payload = {
+                "checkpoint_version": CHECKPOINT_VERSION,
+                "guard_objective_version": GUARD_OBJECTIVE_VERSION,
+                "episode": self.episode,
+                "rollout": self.rollout,
+                "baseline": self.baseline,
+                "elo": self.elo,
+                "scripted_elo": self.scripted_elo,
+                "config": config,
+                # Keep flat config keys for compatibility with existing tools.
+                **config,
+                "best_guard_objective": None if not math.isfinite(self.best_guard_objective) else self.best_guard_objective,
+                "best_guard_context": self.best_guard_context or None,
+                "policy": self.policy.to_json(),
+                "red_policy": self.red_policy.to_json(),
+                "league_pool": [
+                    {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "elo": row["elo"],
+                        "games": row.get("games", 0),
+                        "wins": row.get("wins", 0),
+                        "losses": row.get("losses", 0),
+                        "draws": row.get("draws", 0),
+                        "policy": row["policy"].to_json(),
+                    }
+                    for row in self.league_pool
+                ],
+            }
+        with self.persistence_lock:
+            self._atomic_write_json(self.checkpoint_path, payload)
+
+    def _prepare_best_checkpoint(
+        self,
+        objective: float,
+        *,
+        context: dict,
+        evaluation: dict,
+    ) -> dict | None:
+        if self.guard_in_progress:
+            raise RuntimeError("cannot promote a candidate before guard acceptance")
+        context_id = str(context.get("context_id", ""))
+        if not context_id:
+            raise ValueError("best checkpoint promotion requires a canonical context id")
+        if self.best_guard_context and self.best_guard_context != context_id:
+            raise ValueError("best checkpoint objectives came from incomparable contexts")
+        if objective <= self.best_guard_objective:
+            return None
         self.best_guard_objective = float(objective)
+        self.best_guard_context = context_id
+        config = self._config_payload_locked()
         payload = {
+            "checkpoint_version": CHECKPOINT_VERSION,
+            "guard_objective_version": GUARD_OBJECTIVE_VERSION,
             "episode": self.episode,
+            "rollout": self.rollout,
             "objective": self.best_guard_objective,
+            "objective_context": context,
+            "evaluation": evaluation,
             "baseline": self.baseline,
             "elo": self.elo,
             "scripted_elo": self.scripted_elo,
-            "league_enabled": self.league_enabled,
-            "guard_opponent": self.guard_opponent,
+            "config": config,
+            **config,
             "policy": self.policy.to_json(),
             "red_policy": self.red_policy.to_json(),
             "league_pool": [
@@ -668,49 +1324,131 @@ class RLTrainer:
                 for row in self.league_pool
             ],
         }
-        self.best_checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    def _write_best_checkpoint(self, payload: dict) -> None:
+        with self.persistence_lock:
+            self._atomic_write_json(self.best_checkpoint_path, payload)
 
     def _load_checkpoint(self) -> None:
         if not self.checkpoint_path.exists():
             return
         try:
             payload = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
-            self.episode = int(payload.get("episode", 0))
-            self.baseline = float(payload.get("baseline", 0.0))
-            self.elo = float(payload.get("elo", self.elo))
-            self.scripted_elo = float(payload.get("scripted_elo", self.scripted_elo))
-            self.league_enabled = bool(payload.get("league_enabled", self.league_enabled))
-            self.guard_enabled = bool(payload.get("guard_enabled", self.guard_enabled))
-            self.guard_batch_episodes = int(payload.get("guard_batch_episodes", self.guard_batch_episodes))
-            self.guard_eval_episodes = int(payload.get("guard_eval_episodes", self.guard_eval_episodes))
-            self.guard_accept_margin = float(payload.get("guard_accept_margin", self.guard_accept_margin))
-            self.guard_opponent = str(payload.get("guard_opponent", self.guard_opponent) or self.guard_opponent)
+            checkpoint_version = int(payload.get("checkpoint_version", 0))
+            if checkpoint_version < CHECKPOINT_VERSION:
+                raise ValueError(
+                    "legacy checkpoint predates verified-policy transaction semantics"
+                )
+            config = dict(payload.get("config") or {})
+
+            def config_value(name: str, default):
+                return config.get(name, payload.get(name, default))
+
+            episode = max(0, int(payload.get("episode", 0)))
+            rollout = max(episode, int(payload.get("rollout", episode)))
+            baseline = float(payload.get("baseline", 0.0))
+            elo = float(payload.get("elo", self.elo))
+            scripted_elo = float(payload.get("scripted_elo", self.scripted_elo))
+            learning_rate = max(0.0001, min(0.02, float(config_value("learning_rate", self.learning_rate))))
+            gamma = max(0.8, min(0.999, float(config_value("gamma", self.gamma))))
+            temperature = max(0.25, min(2.5, float(config_value("temperature", self.temperature))))
+            self_play = bool(config_value("self_play", self.self_play))
+            league_enabled = bool(config_value("league_enabled", self.league_enabled))
+            if config_value("guard_enabled", True) is False:
+                raise ValueError("checkpoint disables the mandatory acceptance guard")
+            guard_enabled = True
+            guard_batch_episodes = max(1, min(100, int(config_value("guard_batch_episodes", self.guard_batch_episodes))))
+            guard_eval_episodes = max(32, min(120, int(config_value("guard_eval_episodes", self.guard_eval_episodes))))
+            guard_accept_margin = max(0.0, min(25.0, float(config_value("guard_accept_margin", self.guard_accept_margin))))
+            guard_min_effect = max(
+                GUARD_MIN_EFFECT,
+                min(
+                    25.0,
+                    float(config_value("guard_min_effect", self.guard_min_effect)),
+                ),
+            )
+            guard_min_action_change_rate = max(
+                0.0,
+                min(1.0, float(config_value("guard_min_action_change_rate", self.guard_min_action_change_rate))),
+            )
+            guard_opponent = str(config_value("guard_opponent", self.guard_opponent) or self.guard_opponent)
+            guard_opponent = guard_opponent if guard_opponent in {"mixed", "scripted", "current_red", "league"} else "mixed"
+            coach_enabled = bool(config_value("coach_enabled", self.coach_enabled))
+            coach_rate = max(0.0, min(0.005, float(config_value("coach_rate", self.coach_rate))))
+
+            policy = SoftmaxPolicy(self.policy.obs_dim, self.policy.action_dim)
+            policy.load_json(dict(payload.get("policy") or {}))
+            red_policy = SoftmaxPolicy(self.red_policy.obs_dim, self.red_policy.action_dim, seed=13)
+            red_policy.load_json(dict(payload.get("red_policy") or {}))
+
             best_objective = payload.get("best_guard_objective")
-            if best_objective is not None:
-                self.best_guard_objective = float(best_objective)
-            self.coach_enabled = bool(payload.get("coach_enabled", self.coach_enabled))
-            self.coach_rate = float(payload.get("coach_rate", self.coach_rate))
-            self.policy.load_json(dict(payload.get("policy") or {}))
-            self.red_policy.load_json(dict(payload.get("red_policy") or {}))
-            self.league_pool = []
+            best_context = str(payload.get("best_guard_context") or "")
+            if (best_objective is None) != (not best_context):
+                raise ValueError("checkpoint has incomplete canonical best metadata")
+            expected_best_context = self._promotion_evaluation_setup(policy)[4][
+                "context_id"
+            ]
+            if best_context and best_context != expected_best_context:
+                raise ValueError("checkpoint canonical best context is not comparable")
+            if (
+                best_objective is not None
+                and best_context
+                and int(payload.get("guard_objective_version", 0))
+                == GUARD_OBJECTIVE_VERSION
+            ):
+                best_guard_objective = float(best_objective)
+                best_guard_context = best_context
+            else:
+                best_guard_objective = -math.inf
+                best_guard_context = ""
+
+            league_pool = []
             for row in list(payload.get("league_pool") or [])[-12:]:
-                policy = SoftmaxPolicy(self.policy.obs_dim, self.policy.action_dim)
-                policy.load_json(dict(row.get("policy") or {}))
-                self.league_pool.append(
+                league_policy = SoftmaxPolicy(policy.obs_dim, policy.action_dim)
+                league_policy.load_json(dict(row.get("policy") or {}))
+                league_pool.append(
                     {
-                        "id": int(row.get("id", len(self.league_pool))),
-                        "name": str(row.get("name", f"snapshot {len(self.league_pool)}")),
+                        "id": int(row.get("id", len(league_pool))),
+                        "name": str(row.get("name", f"snapshot {len(league_pool)}")),
                         "elo": float(row.get("elo", 1000.0)),
                         "games": int(row.get("games", 0)),
                         "wins": int(row.get("wins", 0)),
                         "losses": int(row.get("losses", 0)),
                         "draws": int(row.get("draws", 0)),
-                        "policy": policy,
+                        "policy": league_policy,
                     }
                 )
-        except Exception:
-            self.episode = 0
-            self.baseline = 0.0
+
+            # Commit only after the entire payload validates; malformed late
+            # fields can no longer leave a half-loaded policy/configuration.
+            self.episode = episode
+            self.rollout = rollout
+            self.baseline = baseline
+            self.elo = elo
+            self.scripted_elo = scripted_elo
+            self.learning_rate = learning_rate
+            self.gamma = gamma
+            self.temperature = temperature
+            self.self_play = self_play
+            self.league_enabled = league_enabled
+            self.guard_enabled = guard_enabled
+            self.guard_batch_episodes = guard_batch_episodes
+            self.guard_eval_episodes = guard_eval_episodes
+            self.guard_accept_margin = guard_accept_margin
+            self.guard_min_effect = guard_min_effect
+            self.guard_min_action_change_rate = guard_min_action_change_rate
+            self.guard_opponent = guard_opponent
+            self.coach_enabled = coach_enabled
+            self.coach_rate = coach_rate
+            self.policy = policy
+            self.red_policy = red_policy
+            self.best_guard_objective = best_guard_objective
+            self.best_guard_context = best_guard_context
+            self._clear_staged_candidate_locked()
+            self.league_pool = league_pool
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self.last_event = "checkpoint invalid; defaults retained"
 
     def _select_opponent_locked(self, episode_index: int, self_play: bool) -> dict:
         if not self_play:
@@ -830,8 +1568,26 @@ class RLTrainer:
         return ACTION_NAMES.index("balanced")
 
     @staticmethod
-    def _coach_blue(_obs: list[float]) -> int:
-        return ACTION_NAMES.index("possession")
+    def _coach_blue(obs: list[float]) -> int:
+        """Transparent state-based auxiliary heuristic, never a constant label."""
+        minute, ball_x, _ball_y, possession, goal_diff, _shot_diff, blue_stamina, red_stamina, *_ = obs
+        if blue_stamina < 0.38:
+            return ACTION_NAMES.index("conserve")
+        if minute > 0.72 and goal_diff > 0.0:
+            return ACTION_NAMES.index("low_block")
+        if goal_diff < -0.34 or (minute > 0.72 and goal_diff < 0.0):
+            return ACTION_NAMES.index("direct_attack")
+        if possession < 0.0 and ball_x < -0.25:
+            return ACTION_NAMES.index("counter")
+        if possession < 0.0:
+            return ACTION_NAMES.index("high_press")
+        if possession > 0.0 and ball_x > 0.35:
+            return ACTION_NAMES.index("direct_attack")
+        if red_stamina < 0.45:
+            return ACTION_NAMES.index("high_press")
+        if possession > 0.0:
+            return ACTION_NAMES.index("possession")
+        return ACTION_NAMES.index("balanced")
 
     @staticmethod
     def _invert_obs(obs: list[float]) -> list[float]:

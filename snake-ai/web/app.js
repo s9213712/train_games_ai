@@ -60,6 +60,13 @@ const modelFile = document.getElementById("modelFile");
 const modelStatus = document.getElementById("modelStatus");
 const cnnSummary = document.getElementById("cnnSummary");
 const deviceStatus = document.getElementById("deviceStatus");
+const startBtn = document.getElementById("startBtn");
+const guardState = document.getElementById("guardState");
+const guardDevDelta = document.getElementById("guardDevDelta");
+const guardHoldoutScore = document.getElementById("guardHoldoutScore");
+const guardHoldoutDelta = document.getElementById("guardHoldoutDelta");
+const guardSeeds = document.getElementById("guardSeeds");
+const previewSource = document.getElementById("previewSource");
 
 let frames = [];
 let frameVersion = -1;
@@ -81,8 +88,11 @@ async function api(path, options = {}) {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
-  if (!response.ok) throw new Error(`${path}: ${response.status}`);
-  return response.json();
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.error || `${path}: ${response.status}`);
+  }
+  return payload;
 }
 
 function filenameFromDisposition(disposition) {
@@ -137,6 +147,7 @@ function readConfig() {
 
 function readLiveConfig() {
   return {
+    strategy: fields.strategy.value,
     learning_rate: Number(fields.learningRate.value),
     gamma: Number(fields.gamma.value),
     ent_coef: Number(fields.entCoef.value),
@@ -347,7 +358,12 @@ function updateStatus(data) {
   fillConfig(data.config);
   renderCnnArchitecture(data.architecture);
   renderDeviceStatus(data);
-  stateEl.textContent = data.running ? "running" : "paused";
+  const trainingEnabled = Boolean(data.config?.training_enabled);
+  const strategy = data.config?.strategy || "model";
+  stateEl.textContent = data.running
+    ? (trainingEnabled ? "PPO training" : `${strategy} preview`)
+    : "paused";
+  startBtn.textContent = trainingEnabled ? "Start PPO Training" : "Run Preview Only";
   eventEl.textContent = data.last_event || "ready";
   trainedStepsEl.textContent = data.trained_steps;
   bestScoreEl.textContent = data.best?.score ?? 0;
@@ -357,12 +373,39 @@ function updateStatus(data) {
   lengthEl.textContent = lastFrame?.length ?? lastFrame?.snake?.length ?? 3;
   foodCountEl.textContent = lastFrame?.food_count ?? 0;
   const lastHistory = data.history[data.history.length - 1];
+  const guard = data.guard || {};
+  const decision = guard.decision || {};
+  const holdoutCandidate = guard.holdout_candidate || {};
+  const holdoutBaseline = guard.holdout_baseline || {};
+  guardState.textContent = guard.reason
+    ? `${guard.accepted ? "accepted" : "rejected"}${guard.promoted_to_best ? " · promoted best" : ""} · ${guard.reason}`
+    : "no guarded candidate yet";
+  guardDevDelta.textContent = decision.development_delta === undefined
+    ? "—"
+    : Number(decision.development_delta).toFixed(5);
+  guardHoldoutScore.textContent = holdoutCandidate.objective === undefined
+    ? "—"
+    : `${Number(holdoutBaseline.objective || 0).toFixed(5)} → ${Number(holdoutCandidate.objective).toFixed(5)}`;
+  guardHoldoutDelta.textContent = decision.holdout_delta === undefined || decision.holdout_delta === null
+    ? "—"
+    : Number(decision.holdout_delta).toFixed(5);
+  guardSeeds.textContent = guard.holdout_seed_base === undefined
+    ? "—"
+    : `${guard.holdout_seed_base}… (${guard.holdout_episodes} episodes)`;
+  previewSource.textContent = (lastHistory?.preview_strategy || strategy) === "hamiltonian"
+    ? "Hamiltonian oracle (not PPO evidence)"
+    : "PPO model policy";
   stepsPerFoodEl.textContent = lastHistory?.avg_steps_per_food ?? 0;
   loopRevisitsEl.textContent = lastHistory?.loop_revisits ?? lastFrame?.loop_revisit_count ?? 0;
   oscillationsEl.textContent = lastHistory?.oscillations ?? lastFrame?.oscillation_count ?? 0;
   rewardEl.textContent = Number(lastFrame?.reward || 0).toFixed(4);
   fpsEl.textContent = lastHistory?.fps ?? 0;
   drawChart(data.history);
+
+  importModelBtn.disabled = !data.model_upload_enabled;
+  if (!data.model_upload_enabled && !modelFile.files.length) {
+    modelStatus.textContent = "Import is disabled for safety. Launch with SNAKE_ENABLE_MODEL_UPLOAD=1 for trusted local bundles.";
+  }
 
   if (data.last_error) {
     errorBox.hidden = false;
@@ -387,6 +430,15 @@ async function poll() {
   try {
     const data = await api("/api/status");
     updateStatus(data);
+  } catch (error) {
+    errorBox.hidden = false;
+    errorBox.textContent = error.message;
+  }
+}
+
+async function runAction(action) {
+  try {
+    await action();
   } catch (error) {
     errorBox.hidden = false;
     errorBox.textContent = error.message;
@@ -439,36 +491,37 @@ fields.boardSize.addEventListener("input", () => {
   }
 });
 
-document.getElementById("startBtn").addEventListener("click", async () => {
+startBtn.addEventListener("click", () => runAction(async () => {
+  await api("/api/settings", { method: "POST", body: JSON.stringify(readLiveConfig()) });
   await api("/api/start", { method: "POST" });
   await poll();
-});
+}));
 
-document.getElementById("pauseBtn").addEventListener("click", async () => {
+document.getElementById("pauseBtn").addEventListener("click", () => runAction(async () => {
   await api("/api/pause", { method: "POST" });
   await poll();
-});
+}));
 
-document.getElementById("resetBtn").addEventListener("click", async () => {
+document.getElementById("resetBtn").addEventListener("click", () => runAction(async () => {
   const data = await api("/api/reset", { method: "POST", body: JSON.stringify({}) });
   clearDirtyFields();
   resetPlaybackFrames();
   updateStatus(data);
   modelStatus.textContent = "Model reset with the current backend config.";
-});
+}));
 
-document.getElementById("applyBtn").addEventListener("click", async () => {
+document.getElementById("applyBtn").addEventListener("click", () => runAction(async () => {
   await api("/api/settings", { method: "POST", body: JSON.stringify(readLiveConfig()) });
   await poll();
-});
+}));
 
-document.getElementById("resetConfigBtn").addEventListener("click", async () => {
+document.getElementById("resetConfigBtn").addEventListener("click", () => runAction(async () => {
   const data = await api("/api/reset", { method: "POST", body: JSON.stringify(readConfig()) });
   clearDirtyFields();
   resetPlaybackFrames();
   updateStatus(data);
   modelStatus.textContent = "Model rebuilt with the selected config. Press Start to train.";
-});
+}));
 
 downloadModelBtn.addEventListener("click", async () => {
   try {
@@ -514,7 +567,7 @@ importModelBtn.addEventListener("click", async () => {
     resetPlaybackFrames();
     clearDirtyFields();
     updateStatus(data);
-    modelStatus.textContent = `Imported at ${data.trained_steps} steps. Press Start to continue.`;
+    modelStatus.textContent = `Imported as an unverified baseline at ${data.trained_steps} model steps. Start guarded training to establish fresh evidence.`;
   } catch (error) {
     modelStatus.textContent = error.message;
   }

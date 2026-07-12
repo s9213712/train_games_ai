@@ -11,6 +11,24 @@ Unified workspace for four game AI training dashboards:
 
 Each subproject keeps its own README and runtime instructions.
 
+## Training Integrity
+
+Every dashboard now treats a training chunk as a candidate transaction. A
+candidate is not served or checkpointed merely because parameters changed:
+the policy must change its deterministic behavior, improve on a paired
+evaluation, and satisfy a separate promotion check without regressing the
+protected reference. An unaccepted policy is never served or written as the
+authoritative checkpoint; accepted state is restored after rejection, while
+attempt counters (and Soccer's explicitly private in-memory staging) may still
+advance to avoid replaying the same proposal forever. Training and evaluation
+seed namespaces are disjoint, protected-best objectives are compared only
+under the same frozen protocol, and stale checkpoint formats are quarantined
+instead of silently treated as new evidence.
+
+The browser-only Hamiltonian/mutation previews in Snake, Soccer, and Tetris are
+labelled separately from backend learning. They do not increment accepted
+training progress or qualify a checkpoint.
+
 ## Runtime Model Audit
 
 After local training, run:
@@ -19,9 +37,14 @@ After local training, run:
 python3 scripts/audit_usable_models.py
 ```
 
-The audit checks the ignored `runtime/` artifacts for all four games, verifies
-that Chess loads its best checkpoint, evaluates Snake/Soccer/Tetris with fixed
-seeds, and writes `runtime/usable_model_audit_latest.json`.
+The audit does not trust embedded "improved" flags. It reloads each protected
+artifact, compares its deterministic behavior against a fresh or built-in
+baseline on independent same-seed episodes/positions, validates the current
+checkpoint protocol and acceptance evidence, and writes
+`runtime/usable_model_audit_latest.json`. `overall_training_verified` is false
+until all four runtime artifacts pass that strict check; an old artifact can be
+safe because the dashboard quarantines it while still not counting as verified
+training.
 
 ## Repository Notes
 

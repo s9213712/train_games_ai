@@ -159,6 +159,16 @@ button:hover {
   text-transform: uppercase;
 }
 
+.notice {
+  margin: -4px 0 2px;
+  padding: 9px 10px;
+  border-left: 3px solid var(--accent-2);
+  background: #20262c;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .weights {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));

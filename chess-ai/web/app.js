@@ -26,6 +26,7 @@ const el = {
   lines: document.getElementById("lines"),
   moves: document.getElementById("moves"),
   weights: document.getElementById("weights"),
+  guard: document.getElementById("guardBox"),
   stockfish: document.getElementById("stockfishBox"),
   error: document.getElementById("errorBox"),
   teacherDepth: document.getElementById("teacherDepth"),
@@ -38,6 +39,7 @@ const el = {
   wMobility: document.getElementById("wMobility"),
   wCenter: document.getElementById("wCenter"),
   wKing: document.getElementById("wKing"),
+  wReply: document.getElementById("wReply"),
 };
 
 const PIECES = {
@@ -135,14 +137,14 @@ function fillInputs() {
   if (document.activeElement !== el.learningRate) el.learningRate.value = Number(cfg.learning_rate ?? 0).toFixed(3);
   if (document.activeElement !== el.exploration) el.exploration.value = Math.round(cfg.exploration * 100);
   if (document.activeElement !== el.mutation) el.mutation.value = Math.round(cfg.mutation * 100);
-  for (const [element, key] of [[el.wMaterial, "material"], [el.wMobility, "mobility"], [el.wCenter, "center"], [el.wKing, "king_safety"]]) {
+  for (const [element, key] of [[el.wMaterial, "material"], [el.wMobility, "mobility"], [el.wCenter, "center"], [el.wKing, "king_safety"], [el.wReply, "reply_safety"]]) {
     if (document.activeElement !== element) element.value = Number(w[key]).toFixed(2);
   }
 }
 
 function render() {
   if (!state) return;
-  el.runState.textContent = state.running ? "running" : "paused";
+  el.runState.textContent = state.running ? "training + verifying" : "paused";
   el.eventText.textContent = state.last_event || "ready";
   el.game.textContent = state.game;
   el.ply.textContent = state.ply;
@@ -154,18 +156,30 @@ function render() {
   el.winRate.textContent = `${Math.round((learning.win_rate || 0) * 100)}%`;
   el.matchRate.textContent = `${Math.round((learning.match_rate || 0) * 100)}%`;
   el.samples.textContent = learning.samples || 0;
-  el.trainLoss.textContent = Number(learning.td_error || 0).toFixed(3);
-  el.strength.textContent = learning.strength || 800;
+  el.trainLoss.textContent = Number(learning.update_signal_ema || 0).toFixed(3);
+  el.strength.textContent = `${learning.accepted_chunks || 0} / ${learning.rejected_chunks || 0}`;
   el.updates.textContent = learning.updates || 0;
   el.lines.innerHTML = (state.teacher?.lines || []).map((line, index) => (
     `<div>${index + 1}. ${line.move} <span>${line.score_cp ?? 0} cp</span> <span>${(line.pv || []).join(" ")}</span></div>`
   )).join("") || "<div>No teacher line yet</div>";
   el.moves.innerHTML = (state.moves || []).slice().reverse().map((move) => (
-    `<div>${move.ply}. ${move.san} <span>${move.uci}</span> <span>teacher ${move.teacher || "-"}</span> <span>${move.match ? "teacher match" : `td ${Number(move.loss || 0).toFixed(2)}`}</span>${move.fallback ? " <span>guarded</span>" : ""}</div>`
+    `<div>${move.ply}. ${move.san} <span>${move.uci}</span> <span>teacher ${move.teacher || "-"}</span> <span>${move.match ? "teacher match" : `signal ${Number(move.loss || 0).toFixed(2)}`}</span>${move.fallback ? " <span>safety fallback</span>" : ""}</div>`
   )).join("") || "<div>No moves yet</div>";
   el.weights.innerHTML = Object.entries(state.weights).map(([key, val]) => (
     `<div><span>${key}</span><strong>${Number(val).toFixed(2)}</strong></div>`
   )).join("");
+  const guard = state.guard || {};
+  if (guard.baseline && guard.candidate) {
+    const holdoutBefore = Number(guard.holdout_baseline?.avg_gap ?? 0).toFixed(1);
+    const holdoutAfter = Number(guard.holdout_candidate?.avg_gap ?? 0).toFixed(1);
+    const auditBefore = Number(guard.audit_baseline?.avg_gap ?? 0).toFixed(1);
+    const auditAfter = Number(guard.audit_candidate?.avg_gap ?? 0).toFixed(1);
+    el.guard.className = `stockfish ${guard.accepted ? "ok" : "warn"}`;
+    el.guard.textContent = `${guard.accepted ? "ACCEPTED" : "REJECTED"}: guard ${Number(guard.baseline.avg_gap).toFixed(1)}→${Number(guard.candidate.avg_gap).toFixed(1)}, holdout ${holdoutBefore}→${holdoutAfter}, audit ${auditBefore}→${auditAfter}. ${guard.reason || ""}`;
+  } else {
+    el.guard.className = "stockfish warn";
+    el.guard.textContent = guard.reason || "No candidate has completed all three checks yet.";
+  }
   const sf = state.stockfish || {};
   el.stockfish.className = `stockfish ${sf.connected ? "ok" : "warn"}`;
   el.stockfish.textContent = sf.connected
@@ -206,12 +220,6 @@ function readConfig() {
     learning_rate: Number(el.learningRate.value),
     exploration: Number(el.exploration.value) / 100,
     mutation: Number(el.mutation.value) / 100,
-    weights: {
-      material: Number(el.wMaterial.value),
-      mobility: Number(el.wMobility.value),
-      center: Number(el.wCenter.value),
-      king_safety: Number(el.wKing.value),
-    },
   };
 }
 

@@ -18,9 +18,9 @@
             </div>
           </div>
           <div class="actions">
-            <button id="startBtn" class="primary">Start</button>
-            <button id="pauseBtn">Pause</button>
-            <button id="resetBtn">Reset</button>
+            <button id="startBtn" class="primary">Preview Start</button>
+            <button id="pauseBtn">Preview Pause</button>
+            <button id="resetBtn">Preview Reset</button>
           </div>
         </header>
 
@@ -42,7 +42,7 @@
           </section>
 
           <section class="analysis-panel">
-            <div class="section-title">Training History</div>
+            <div class="section-title">Browser Mutation Preview History</div>
             <canvas id="chart" width="680" height="210"></canvas>
             <div class="weights" id="weights"></div>
           </section>
@@ -50,7 +50,8 @@
       </section>
 
       <aside class="controls">
-        <div class="section-title">Training</div>
+        <div class="section-title">Browser Mutation Preview</div>
+        <p class="mode-note">Visual sandbox only: random JavaScript mutation is not backend RL, is not checkpointed, and is not evidence of learning.</p>
         <label>Speed <input id="speed" type="range" min="1" max="120" value="18" /></label>
         <label>Exploration <input id="epsilon" type="range" min="0" max="60" value="18" /></label>
         <label>Mutation <input id="mutation" type="range" min="1" max="80" value="22" /></label>
@@ -60,23 +61,24 @@
           <button id="fastBtn">Burst</button>
         </div>
 
-        <div class="section-title">Policy</div>
+        <div class="section-title">Browser Preview Policy</div>
         <label>Lines <input id="wLines" type="number" step="0.1" /></label>
         <label>Height <input id="wHeight" type="number" step="0.1" /></label>
         <label>Holes <input id="wHoles" type="number" step="0.1" /></label>
         <label>Bumpiness <input id="wBumpiness" type="number" step="0.1" /></label>
         <label>Wells <input id="wWells" type="number" step="0.1" /></label>
         <button id="applyWeightsBtn" class="primary">Apply Weights</button>
-        <div class="section-title">Backend RL</div>
+        <div class="section-title">Guarded Backend RL Training</div>
+        <p class="mode-note verified">This is the real TD trainer. A batch becomes live only after a fresh paired gate and the fixed canonical promotion validation both improve.</p>
         <div class="grid-two">
-          <button id="rlStartBtn" class="primary">RL Start</button>
-          <button id="rlPauseBtn">RL Pause</button>
+          <button id="rlStartBtn" class="primary">Backend Start</button>
+          <button id="rlPauseBtn">Backend Pause</button>
         </div>
         <div class="grid-two">
-          <button id="rlStepBtn">Guarded 10</button>
-          <button id="rlResetBtn">RL Reset</button>
+          <button id="rlStepBtn">Guarded Train ×10</button>
+          <button id="rlResetBtn">Backend Reset</button>
         </div>
-        <label>TD Rate <input id="rlRate" type="number" min="0.0001" max="0.2" step="0.0001" value="0.0005" /></label>
+        <label>TD Rate <input id="rlRate" type="number" min="0.0005" max="0.2" step="0.0001" value="0.0005" /></label>
         <label>Epsilon <input id="rlEpsilon" type="number" min="0" max="0.5" step="0.005" value="0.015" /></label>
         <label>Lookahead <input id="rlLookahead" type="number" min="0" max="0.95" step="0.05" value="0.10" /></label>
         <label>Future Hold <input id="rlFutureHold" type="checkbox" /></label>
@@ -97,6 +99,6 @@
         <div id="errorBox" class="error" hidden></div>
       </aside>
     </main>
-    <script src="/app.js?v=20260704-strong-eval"></script>
+    <script src="/app.js?v=20260712-training-integrity"></script>
   </body>
 </html>

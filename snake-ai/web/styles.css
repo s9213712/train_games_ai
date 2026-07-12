@@ -234,6 +234,32 @@ button:hover {
   color: #ffe0a3;
 }
 
+.guard-evidence {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #12161a;
+  padding: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.guard-evidence div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.guard-evidence strong {
+  color: var(--text);
+  text-align: right;
+}
+
+.strategy-hint {
+  grid-column: 1 / -1;
+}
+
 .controls {
   display: flex;
   flex-direction: column;

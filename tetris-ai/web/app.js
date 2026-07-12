@@ -220,7 +220,7 @@ function nextEpisode() {
     state.bestReward = episodeReward;
     bestWeights = { ...state.weights };
     state.baselineReward = episodeReward;
-    setEvent("new best");
+    setEvent("browser preview best (not checkpointed)");
   } else if (Math.random() < 0.22) {
     state.weights = { ...bestWeights };
   }
@@ -381,8 +381,8 @@ function loop(ts) {
   requestAnimationFrame(loop);
 }
 
-el.start.addEventListener("click", () => { running = true; setEvent("training"); draw(); });
-el.pause.addEventListener("click", () => { running = false; setEvent("paused"); draw(); });
+el.start.addEventListener("click", () => { running = true; setEvent("browser mutation preview (not backend training)"); draw(); });
+el.pause.addEventListener("click", () => { running = false; setEvent("browser preview paused"); draw(); });
 el.reset.addEventListener("click", () => { running = false; resetAll(); });
 el.step.addEventListener("click", () => { stepGame(); draw(); });
 el.fast.addEventListener("click", () => { for (let i = 0; i < 1000; i += 1) stepGame(); draw(); });
@@ -437,22 +437,24 @@ function renderRl(data) {
   const guardText = guard.episodes
     ? `${guard.accepted ? "accepted" : "rejected"} · ${Number(guard.baseline_score || 0).toFixed(0)} -> ${Number(guard.candidate_score || 0).toFixed(0)} · T ${Number(guard.baseline_tetrises || 0).toFixed(2)} -> ${Number(guard.candidate_tetrises || 0).toFixed(2)}`
     : "none";
+  const promotion = guard.promotion || {};
   rl.box.innerHTML = [
-    `<div>Mode <strong>${data.running ? "training" : "paused"}</strong> · Episode <strong>${data.episode || 0}</strong></div>`,
+    `<div>Backend RL <strong>${data.running ? "guarded training" : "paused"}</strong> · Episode <strong>${data.episode || 0}</strong></div>`,
     `<div>Avg <strong>${Number(record.avg_score || 0).toFixed(1)}</strong> score · <strong>${Number(record.avg_lines || 0).toFixed(1)}</strong> lines · T <strong>${Number(record.avg_tetrises || 0).toFixed(2)}</strong></div>`,
     `<div>Best <strong>${record.best_score || 0}</strong> score · <strong>${record.best_lines || 0}</strong> lines</div>`,
     `<div>Latest <strong>${latest.score || 0}</strong> score · <strong>${latest.lines || 0}</strong> lines · T <strong>${latest.tetrises || 0}</strong> · H <strong>${latest.holds || 0}</strong> · ${latest.pieces || 0} pieces</div>`,
     `<div>Eval <strong>${Number(evalData.avg_score || 0).toFixed(1)}</strong> score · <strong>${Number(evalData.avg_lines || 0).toFixed(1)}</strong> lines · T <strong>${Number(evalData.avg_tetrises || 0).toFixed(2)}</strong> · H <strong>${Number(evalData.avg_holds || 0).toFixed(1)}</strong> · best <strong>${evalData.best_score || 0}</strong>${evalData.future_hold ? " · strong" : ""}</div>`,
     `<div>Config <strong>lookahead ${Number((data.config || {}).lookahead_weight || 0).toFixed(2)} · top ${Number((data.config || {}).lookahead_candidates || 0)} · future hold ${(data.config || {}).lookahead_include_hold ? "on" : "off"}</strong></div>`,
-    `<div>Guard <strong>${guardText}</strong></div>`,
+    `<div>Fresh paired gate <strong>${guardText}</strong>${guard.eval_episodes ? ` · ${guard.eval_episodes} seeds · Δ ${Number(guard.objective_improvement || 0).toFixed(2)} / min ${Number(guard.minimum_effect || 0).toFixed(2)}` : ""}</div>`,
+    `<div>Fixed canonical promotion validation <strong>${promotion.evaluated ? (promotion.promoted ? "promoted" : "not promoted") : "not run"}</strong>${promotion.evaluated ? ` · Δ ${Number(promotion.objective_improvement || 0).toFixed(2)} / min ${Number(promotion.minimum_effect || 0).toFixed(2)}` : ""}</div>`,
     `<div>Reward <strong>lines ${Number(terms.lines || 0).toFixed(2)} · well ${Number(terms.well || 0).toFixed(2)} · eroded ${Number(terms.eroded || 0).toFixed(2)} · shape ${Number(terms.shape || 0).toFixed(2)}</strong></div>`,
     `<div>Weights <strong>L ${Number(weights.lines || 0).toFixed(2)} H ${Number(weights.height || 0).toFixed(2)} Holes ${Number(weights.holes || 0).toFixed(2)} Well ${Number(weights.right_well || 0).toFixed(2)}</strong></div>`,
     `<div>${data.last_event || "ready"}</div>`,
   ].join("");
   if (data.config) {
     if (document.activeElement !== rl.rate) rl.rate.value = Number(data.config.learning_rate || 0.0005).toFixed(4);
-    if (document.activeElement !== rl.epsilon) rl.epsilon.value = Number(data.config.epsilon || 0.015).toFixed(3);
-    if (document.activeElement !== rl.lookahead) rl.lookahead.value = Number(data.config.lookahead_weight || 0.1).toFixed(2);
+    if (document.activeElement !== rl.epsilon) rl.epsilon.value = Number(data.config.epsilon ?? 0.015).toFixed(3);
+    if (document.activeElement !== rl.lookahead) rl.lookahead.value = Number(data.config.lookahead_weight ?? 0.1).toFixed(2);
     if (document.activeElement !== rl.futureHold) rl.futureHold.checked = Boolean(data.config.lookahead_include_hold);
   }
 }
@@ -551,7 +553,7 @@ if (rl.start) {
   rl.start.addEventListener("click", async () => renderRl(await rlApi("/api/rl/start", rlConfig())));
   rl.pause.addEventListener("click", async () => renderRl(await rlApi("/api/rl/pause", {})));
   rl.step.addEventListener("click", async () => {
-    renderRl(await rlApi("/api/rl/step", { ...rlConfig(), episodes: 10, eval_episodes: 2 }));
+    renderRl(await rlApi("/api/rl/step", { ...rlConfig(), episodes: 10, eval_episodes: 4 }));
     await loadBackendReplay();
   });
   rl.reset.addEventListener("click", async () => renderRl(await rlApi("/api/rl/reset", {})));
@@ -581,7 +583,7 @@ if (rl.start) {
     renderRl(payload.state);
   });
   rl.strongEval.addEventListener("click", async () => {
-    const payload = await rlApi("/api/rl/evaluate", { episodes: 2, lookahead_include_hold: true });
+    const payload = await rlApi("/api/rl/evaluate", { episodes: 4, lookahead_include_hold: true });
     renderRl(payload.state);
   });
   refreshRl();

@@ -68,7 +68,7 @@ def main(argv=None):
     if max_steps is None:
         max_steps = args.board_size * args.board_size * 8
 
-    env = env_cls(
+    env_kwargs = dict(
         seed=seed,
         board_size=args.board_size,
         limit_step=False,
@@ -84,8 +84,10 @@ def main(argv=None):
         loop_window=args.loop_window,
         oscillation_penalty=args.oscillation_penalty,
         oscillation_window=args.oscillation_window,
-        channel_first=args.cnn_channel_first if env_cls is SnakeCnnEnv else False,
     )
+    if env_cls is SnakeCnnEnv:
+        env_kwargs["channel_first"] = args.cnn_channel_first
+    env = env_cls(**env_kwargs)
 
     model_path = Path(args.model_path) if args.model_path else default_model_path(args.agent, device)
     model = MaskablePPO.load(
