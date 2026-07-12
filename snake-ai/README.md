@@ -110,6 +110,13 @@ For a quick smoke training run:
 python train.py --agent cnn --total-timesteps 4096 --num-envs 2 --no-stdout-log
 ```
 
+CNN observations are always exact 84×84 `uint8` images. The board size must
+divide 84 exactly (supported values: 3, 4, 6, 7, 12, 14, 21, 28, 42, and 84),
+otherwise the CLI fails before creating training output. CNN training defaults
+to CHW observations; `--no-cnn-channel-first` selects HWC, which SB3 transposes
+internally. Both layouts use the same guarded promotion protocol. Run
+`python train.py --help` to inspect these options without starting training.
+
 `--checkpoint-interval-timesteps` is measured in total environment transitions,
 independent of `--num-envs` (`--checkpoint-interval` remains a compatibility
 alias). Training output is appended to `training_log.txt` with a session marker,
@@ -134,6 +141,23 @@ python train_cnn.py
 python train_mlp.py
 ```
 
+### GUI Training Preview (Unverified Candidates Only)
+
+`./run_gui_train_demo.sh` is an interactive training preview, not an official
+promotion path. It deliberately skips the paired development/fixed-holdout
+guard used by `train.py`, so its Pygame title, status text, and terminal output
+all label the policy as **UNVERIFIED CANDIDATE**. The demo writes only
+`ppo_snake_<agent>_gui_demo_candidate_unverified.zip` plus a matching
+`.guard.json` report; the bundle embeds the same report with
+`verified: false`. It never writes `ppo_snake_final.zip` or a dashboard
+protected-best bundle. Run `train.py` (or guarded dashboard PPO training) when
+the result must be eligible for verified promotion. The report records the
+actual `model.num_timesteps` delta (which may exceed the requested chunk because
+SB3 completes full rollouts). Pressing Ctrl+C is treated as a normal interactive
+stop: the partial candidate is saved with `termination_reason:
+keyboard_interrupt`. Other runtime errors still propagate and are not disguised
+as a successful demo run.
+
 ### Interactive Web Dashboard
 
 You can watch training and adjust live parameters in a browser:
@@ -154,7 +178,17 @@ and remain recorded in the exported history.
 
 Use **Download Model** to save a `.snakeai.zip` bundle containing the Stable-Baselines3 model plus dashboard metadata. Upload is disabled by default because SB3 bundles contain trusted Python serialization. For trusted local bundles, launch with `SNAKE_ENABLE_MODEL_UPLOAD=1 ./run_web_dashboard.sh`, then use **Import And Pause**. A manual import loads its weights only as an unverified baseline: imported history, old guard claims, and protected-best provenance are cleared, so fresh guarded training must establish new evidence.
 
-At startup the dashboard automatically resumes only an internally protected bundle with dashboard format version 2 or newer, a structurally valid fixed-holdout benchmark, and the exact current holdout protocol/configuration. Legacy, stale-format, malformed, or protocol-mismatched files at the protected path are moved to a quarantine filename and are never served as the active policy; the dashboard clearly reports the quarantine and falls back to the repository baseline (or a newly initialized model). Merely possessing legacy weights or old guard metadata does not make a model verified.
+At startup the dashboard resumes only an internally protected bundle with the
+exact current dashboard format (v3) and fixed-holdout protocol. MLP, CNN, and
+each complete CNN architecture/layout use separate agent+protocol checkpoint
+namespaces. Promotion evidence must be accepted, include real attempted steps,
+show development improvement and holdout non-regression, and bind the exact
+embedded `model.zip` SHA-256. Before serving the weights, the dashboard loads
+them and reproduces the stored fixed-holdout score/food/objective. Legacy,
+future-version, malformed, replaced, or non-reproducible bundles are moved to a
+quarantine filename and the dashboard falls back to the repository baseline
+(or a newly initialized model). Merely possessing changed weights or editable
+guard metadata does not make a model verified.
 
 ### Viewing Curves
 

@@ -88,8 +88,11 @@ async function api(path, options = {}) {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
-  if (!response.ok) throw new Error(`${path}: ${response.status}`);
-  return response.json();
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.error || `${path}: ${response.status}`);
+  }
+  return payload;
 }
 
 function filenameFromDisposition(disposition) {
@@ -433,6 +436,15 @@ async function poll() {
   }
 }
 
+async function runAction(action) {
+  try {
+    await action();
+  } catch (error) {
+    errorBox.hidden = false;
+    errorBox.textContent = error.message;
+  }
+}
+
 function animate() {
   const now = performance.now();
   if (now - lastFrameAt < frameDelayMs) {
@@ -479,37 +491,37 @@ fields.boardSize.addEventListener("input", () => {
   }
 });
 
-startBtn.addEventListener("click", async () => {
+startBtn.addEventListener("click", () => runAction(async () => {
   await api("/api/settings", { method: "POST", body: JSON.stringify(readLiveConfig()) });
   await api("/api/start", { method: "POST" });
   await poll();
-});
+}));
 
-document.getElementById("pauseBtn").addEventListener("click", async () => {
+document.getElementById("pauseBtn").addEventListener("click", () => runAction(async () => {
   await api("/api/pause", { method: "POST" });
   await poll();
-});
+}));
 
-document.getElementById("resetBtn").addEventListener("click", async () => {
+document.getElementById("resetBtn").addEventListener("click", () => runAction(async () => {
   const data = await api("/api/reset", { method: "POST", body: JSON.stringify({}) });
   clearDirtyFields();
   resetPlaybackFrames();
   updateStatus(data);
   modelStatus.textContent = "Model reset with the current backend config.";
-});
+}));
 
-document.getElementById("applyBtn").addEventListener("click", async () => {
+document.getElementById("applyBtn").addEventListener("click", () => runAction(async () => {
   await api("/api/settings", { method: "POST", body: JSON.stringify(readLiveConfig()) });
   await poll();
-});
+}));
 
-document.getElementById("resetConfigBtn").addEventListener("click", async () => {
+document.getElementById("resetConfigBtn").addEventListener("click", () => runAction(async () => {
   const data = await api("/api/reset", { method: "POST", body: JSON.stringify(readConfig()) });
   clearDirtyFields();
   resetPlaybackFrames();
   updateStatus(data);
   modelStatus.textContent = "Model rebuilt with the selected config. Press Start to train.";
-});
+}));
 
 downloadModelBtn.addEventListener("click", async () => {
   try {

@@ -14,7 +14,20 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 
 from snake_env import SnakeCnnEnv, SnakeMlpEnv
-from train import linear_schedule, select_device
+from train import (
+    linear_schedule,
+    save_model_atomic,
+    select_device,
+    write_json_atomic,
+)
+
+
+GUI_DEMO_REPORT_FORMAT = "snake-gui-demo-unverified-v1"
+GUI_DEMO_UNVERIFIED_REASON = "gui_demo_has_no_promotion_evaluation"
+GUI_DEMO_WARNING = (
+    "UNVERIFIED CANDIDATE: the GUI demo previews PPO updates but does not run "
+    "the development/holdout promotion guard. Use train.py for verified training."
+)
 
 
 def make_train_env(env_cls, seed, board_size):
@@ -30,7 +43,11 @@ def make_train_env(env_cls, seed, board_size):
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Train a tiny Snake agent and periodically show it in a Pygame window."
+        description=(
+            "Preview an unverified Snake PPO candidate while it trains. "
+            "This demo never produces an official/final model."
+        ),
+        epilog="Use train.py when you need a guarded, promotion-eligible model.",
     )
     parser.add_argument("--agent", choices=("mlp", "cnn"), default="mlp")
     parser.add_argument("--board-size", type=int, default=12)
@@ -48,8 +65,59 @@ def build_arg_parser():
     parser.add_argument("--final-clip-range", type=float, default=0.025)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--save-dir", default="gui_train_demo_models")
+    parser.add_argument(
+        "--save-dir",
+        default="gui_train_demo_models",
+        help="directory for the explicitly unverified candidate bundle and report",
+    )
     return parser
+
+
+def unverified_candidate_paths(save_dir, agent):
+    """Return the only artifact paths that this unguarded demo may write."""
+
+    save_dir = Path(save_dir)
+    stem = f"ppo_snake_{agent}_gui_demo_candidate_unverified"
+    return save_dir / f"{stem}.zip", save_dir / f"{stem}.guard.json"
+
+
+def save_unverified_candidate(
+    model,
+    args,
+    trained_steps,
+    *,
+    termination_reason="completed_requested_budget",
+):
+    """Persist demo weights with durable evidence that they are not verified.
+
+    The GUI loop intentionally prioritizes interactive previews and does not run
+    the paired development/fixed-holdout transaction used by ``train.py``.
+    Consequently its output is never eligible for a final or protected path.
+    """
+
+    candidate_path, report_path = unverified_candidate_paths(args.save_dir, args.agent)
+    report = {
+        "format": GUI_DEMO_REPORT_FORMAT,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "source": "gui_train_demo",
+        "artifact": str(candidate_path),
+        "artifact_status": "unverified_candidate",
+        "agent": args.agent,
+        "board_size": int(args.board_size),
+        "requested_timesteps": int(args.total_timesteps),
+        "attempted_timesteps": int(trained_steps),
+        "termination_reason": str(termination_reason),
+        "decision": {
+            "accepted": False,
+            "verified": False,
+            "reason": GUI_DEMO_UNVERIFIED_REASON,
+        },
+        "promotion_evaluation": None,
+        "warning": GUI_DEMO_WARNING,
+    }
+    save_model_atomic(model, candidate_path, embedded_guard_report=report)
+    write_json_atomic(report_path, report)
+    return candidate_path, report_path, report
 
 
 def preview_policy(model, env_cls, args, trained_steps):
@@ -62,18 +130,79 @@ def preview_policy(model, env_cls, args, trained_steps):
         limit_step=False,
         render_mode="human",
     )
-    pygame.display.set_caption(f"Snake AI GUI training demo - {args.agent.upper()}")
+    try:
+        pygame.display.set_caption(
+            f"UNVERIFIED CANDIDATE - Snake AI GUI demo - {args.agent.upper()}"
+        )
 
-    obs, _ = env.reset(seed=args.seed + trained_steps)
-    for step in range(args.preview_steps):
-        env.game.status_text = f"trained: {trained_steps}/{args.total_timesteps}"
-        action, _ = model.predict(obs, action_masks=env.get_action_mask(), deterministic=True)
-        obs, _, terminated, truncated, _ = env.step(action)
-        if terminated or truncated:
-            obs, _ = env.reset(seed=args.seed + trained_steps + step + 1)
-        time.sleep(args.frame_delay)
+        obs, _ = env.reset(seed=args.seed + trained_steps)
+        for step in range(args.preview_steps):
+            env.game.status_text = (
+                "UNVERIFIED candidate preview | "
+                f"trained: {trained_steps}/{args.total_timesteps}"
+            )
+            action, _ = model.predict(
+                obs,
+                action_masks=env.get_action_mask(),
+                deterministic=True,
+            )
+            obs, _, terminated, truncated, _ = env.step(action)
+            if terminated or truncated:
+                obs, _ = env.reset(seed=args.seed + trained_steps + step + 1)
+            time.sleep(args.frame_delay)
+    finally:
+        env.close()
 
-    env.close()
+
+def train_preview_loop(model, env_cls, args):
+    """Run preview chunks and return the actual PPO transition delta.
+
+    SB3 may round a requested chunk up to a full rollout, so requested chunk
+    sizes are not evidence of how many transitions were really collected.
+    ``model.num_timesteps`` is the authoritative counter.  Ctrl+C is a normal
+    interactive stop and returns the partial count; every other exception is
+    deliberately allowed to propagate.
+    """
+
+    initial_timesteps = int(model.num_timesteps)
+    trained_steps = 0
+    termination_reason = "completed_requested_budget"
+
+    try:
+        while trained_steps < args.total_timesteps:
+            next_chunk = min(
+                args.chunk_timesteps,
+                args.total_timesteps - trained_steps,
+            )
+            print(
+                "Training UNVERIFIED candidate chunk: "
+                f"{trained_steps} -> requested {trained_steps + next_chunk}"
+            )
+            before_learn = int(model.num_timesteps)
+            model.learn(
+                total_timesteps=next_chunk,
+                # The model is newly initialized, and keeping the counter
+                # monotonic makes the measured delta unambiguous across chunks.
+                reset_num_timesteps=False,
+                progress_bar=False,
+            )
+            trained_steps = max(0, int(model.num_timesteps) - initial_timesteps)
+            if int(model.num_timesteps) <= before_learn:
+                raise RuntimeError("PPO learn returned without collecting transitions")
+            print(
+                "Previewing UNVERIFIED candidate after "
+                f"{trained_steps} actual timesteps"
+            )
+            preview_policy(model, env_cls, args, trained_steps)
+    except KeyboardInterrupt:
+        trained_steps = max(0, int(model.num_timesteps) - initial_timesteps)
+        termination_reason = "keyboard_interrupt"
+        print(
+            "Ctrl+C received; preserving an explicitly UNVERIFIED candidate "
+            f"after {trained_steps} actual timesteps."
+        )
+
+    return trained_steps, termination_reason
 
 
 def main(argv=None):
@@ -99,29 +228,29 @@ def main(argv=None):
         clip_range=linear_schedule(args.clip_range, args.final_clip_range),
     )
 
-    trained_steps = 0
+    print(GUI_DEMO_WARNING)
     print(
-        "Starting GUI training demo. Close the Pygame window or press Ctrl+C in the terminal to stop."
+        "Starting GUI candidate demo. Close the Pygame window or press Ctrl+C "
+        "in the terminal to stop."
     )
     try:
-        while trained_steps < args.total_timesteps:
-            next_chunk = min(args.chunk_timesteps, args.total_timesteps - trained_steps)
-            print(f"Training chunk: {trained_steps} -> {trained_steps + next_chunk}")
-            model.learn(
-                total_timesteps=next_chunk,
-                reset_num_timesteps=(trained_steps == 0),
-                progress_bar=False,
-            )
-            trained_steps += next_chunk
-            print(f"Previewing policy after {trained_steps} timesteps")
-            preview_policy(model, env_cls, args, trained_steps)
+        trained_steps, termination_reason = train_preview_loop(
+            model,
+            env_cls,
+            args,
+        )
     finally:
         train_env.close()
 
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    model.save(save_dir / f"ppo_snake_{args.agent}_gui_demo.zip")
-    print(f"Saved demo model to {save_dir}")
+    candidate_path, report_path, _report = save_unverified_candidate(
+        model,
+        args,
+        trained_steps,
+        termination_reason=termination_reason,
+    )
+    print(f"Saved UNVERIFIED candidate only: {candidate_path}")
+    print(f"Unverified-candidate evidence: {report_path}")
+    print("No final or protected model was written. Use train.py for guarded promotion.")
 
 
 if __name__ == "__main__":

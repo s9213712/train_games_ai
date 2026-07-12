@@ -2,11 +2,91 @@ import argparse
 import json
 import os
 import random
+import sys
 import tempfile
 import time
 import zipfile
 from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
+
+
+def build_arg_parser():
+    """Build the complete CLI parser without importing the training runtime."""
+
+    parser = argparse.ArgumentParser(description="Train a MaskablePPO Snake agent.")
+    parser.add_argument("--agent", choices=("cnn", "mlp"), default="cnn")
+    parser.add_argument("--board-size", type=int, default=12)
+    parser.add_argument("--num-envs", type=int, default=32)
+    parser.add_argument("--total-timesteps", type=int, default=100_000_000)
+    parser.add_argument("--n-steps", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--n-epochs", type=int, default=4)
+    parser.add_argument("--gamma", type=float, default=0.94)
+    parser.add_argument("--learning-rate", type=float, default=2.5e-4)
+    parser.add_argument("--final-learning-rate", type=float, default=2.5e-6)
+    parser.add_argument("--clip-range", type=float, default=0.15)
+    parser.add_argument("--final-clip-range", type=float, default=0.025)
+    parser.add_argument("--ent-coef", type=float, default=0.0)
+    parser.add_argument("--food-time-penalty", type=float, default=0.0)
+    parser.add_argument("--food-step-limit-multiplier", type=float, default=4.0)
+    parser.add_argument("--food-reward-bonus", type=float, default=0.0)
+    parser.add_argument("--distance-reward-scale", type=float, default=0.1)
+    parser.add_argument("--reachable-space-penalty", type=float, default=0.0)
+    parser.add_argument("--reachable-space-min-ratio", type=float, default=0.35)
+    parser.add_argument("--loop-penalty", type=float, default=0.0)
+    parser.add_argument("--loop-window", type=int, default=16)
+    parser.add_argument("--oscillation-penalty", type=float, default=0.0)
+    parser.add_argument("--oscillation-window", type=int, default=12)
+    parser.add_argument(
+        "--checkpoint-interval-timesteps",
+        "--checkpoint-interval",
+        dest="checkpoint_interval_timesteps",
+        type=int,
+        default=500_000,
+        help=(
+            "Checkpoint interval in total environment transitions (not vector-env callback "
+            "calls). The legacy --checkpoint-interval spelling is retained as an alias."
+        ),
+    )
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--device", default="auto", choices=("auto", "cpu", "cuda", "mps")
+    )
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        default=1,
+        help=(
+            "CPU intra-op threads used by PyTorch. Snake's small networks normally run "
+            "faster and more predictably with one thread; increase explicitly for a "
+            "dedicated host after benchmarking."
+        ),
+    )
+    parser.add_argument(
+        "--cnn-channel-first",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use CHW CNN observations (default); --no-cnn-channel-first selects HWC.",
+    )
+    parser.add_argument("--log-dir", default="logs")
+    parser.add_argument("--save-dir", default=None)
+    parser.add_argument("--load-model", default=None)
+    parser.add_argument("--no-stdout-log", action="store_true")
+    parser.add_argument("--no-step-limit", action="store_true")
+    parser.add_argument("--guard-eval-episodes", type=int, default=8)
+    parser.add_argument("--guard-holdout-episodes", type=int, default=8)
+    parser.add_argument("--guard-max-steps", type=int, default=None)
+    parser.add_argument("--guard-min-delta", type=float, default=0.001)
+    parser.add_argument(
+        "--guard-min-training-timesteps",
+        type=int,
+        default=4096,
+        help=(
+            "Minimum candidate transitions before final-model verification. Shorter smoke "
+            "runs exit successfully but save only an explicitly unverified candidate."
+        ),
+    )
+    return parser
 
 # Apply conservative native-library defaults before importing PyTorch.  The
 # small Snake networks are latency-bound, and unconstrained BLAS/OpenMP pools
@@ -15,6 +95,11 @@ from pathlib import Path
 # must not silently defeat this safety default.  --torch-threads below controls
 # PyTorch itself after argument parsing.
 if __name__ == "__main__":
+    # Help is a metadata-only operation.  Exit before validating runtime-only
+    # environment settings or importing PyTorch/SB3.
+    if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
+        build_arg_parser().parse_args()
+
     _native_threads = os.environ.get("SNAKE_NATIVE_THREADS", "1")
     try:
         if int(_native_threads) < 1:
@@ -29,6 +114,29 @@ if __name__ == "__main__":
     ):
         os.environ[_thread_env_name] = _native_threads
 
+    # Reject an impossible CNN board before importing PyTorch/SB3.  Besides
+    # producing a prompt, useful CLI error, this guarantees invalid input
+    # cannot initialize native training runtimes or create output artifacts.
+    _cnn_preflight = argparse.ArgumentParser(add_help=False)
+    _cnn_preflight.add_argument("--agent", choices=("cnn", "mlp"), default="cnn")
+    _cnn_preflight.add_argument("--board-size", type=int, default=12)
+    _cnn_preflight_args, _unknown = _cnn_preflight.parse_known_args()
+    if (
+        _cnn_preflight_args.agent == "cnn"
+        and "-h" not in sys.argv[1:]
+        and "--help" not in sys.argv[1:]
+    ):
+        _compatible_board_sizes = [
+            size for size in range(3, 85) if 84 % size == 0
+        ]
+        if _cnn_preflight_args.board_size not in _compatible_board_sizes:
+            _cnn_preflight.error(
+                f"CNN board_size={_cnn_preflight_args.board_size} is incompatible "
+                "with image_size=84; board_size must divide 84 exactly. "
+                "Compatible values: "
+                + ", ".join(str(size) for size in _compatible_board_sizes)
+            )
+
 import torch
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
@@ -37,7 +145,13 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 
-from snake_env import SnakeCnnEnv, SnakeMlpEnv
+from snake_env import (
+    CNN_DEFAULT_IMAGE_SIZE,
+    SnakeCnnEnv,
+    SnakeMlpEnv,
+    validate_cnn_board_size,
+    validate_cnn_channel_mode,
+)
 
 
 def linear_schedule(initial_value, final_value=0.0):
@@ -301,78 +415,16 @@ def paired_evaluation_decision(
     }
 
 
-def build_arg_parser():
-    parser = argparse.ArgumentParser(description="Train a MaskablePPO Snake agent.")
-    parser.add_argument("--agent", choices=("cnn", "mlp"), default="cnn")
-    parser.add_argument("--board-size", type=int, default=12)
-    parser.add_argument("--num-envs", type=int, default=32)
-    parser.add_argument("--total-timesteps", type=int, default=100_000_000)
-    parser.add_argument("--n-steps", type=int, default=2048)
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--n-epochs", type=int, default=4)
-    parser.add_argument("--gamma", type=float, default=0.94)
-    parser.add_argument("--learning-rate", type=float, default=2.5e-4)
-    parser.add_argument("--final-learning-rate", type=float, default=2.5e-6)
-    parser.add_argument("--clip-range", type=float, default=0.15)
-    parser.add_argument("--final-clip-range", type=float, default=0.025)
-    parser.add_argument("--ent-coef", type=float, default=0.0)
-    parser.add_argument("--food-time-penalty", type=float, default=0.0)
-    parser.add_argument("--food-step-limit-multiplier", type=float, default=4.0)
-    parser.add_argument("--food-reward-bonus", type=float, default=0.0)
-    parser.add_argument("--distance-reward-scale", type=float, default=0.1)
-    parser.add_argument("--reachable-space-penalty", type=float, default=0.0)
-    parser.add_argument("--reachable-space-min-ratio", type=float, default=0.35)
-    parser.add_argument("--loop-penalty", type=float, default=0.0)
-    parser.add_argument("--loop-window", type=int, default=16)
-    parser.add_argument("--oscillation-penalty", type=float, default=0.0)
-    parser.add_argument("--oscillation-window", type=int, default=12)
-    parser.add_argument(
-        "--checkpoint-interval-timesteps",
-        "--checkpoint-interval",
-        dest="checkpoint_interval_timesteps",
-        type=int,
-        default=500_000,
-        help=(
-            "Checkpoint interval in total environment transitions (not vector-env callback "
-            "calls). The legacy --checkpoint-interval spelling is retained as an alias."
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
-    parser.add_argument(
-        "--torch-threads",
-        type=int,
-        default=1,
-        help=(
-            "CPU intra-op threads used by PyTorch. Snake's small networks normally run "
-            "faster and more predictably with one thread; increase explicitly for a "
-            "dedicated host after benchmarking."
-        ),
-    )
-    parser.add_argument("--cnn-channel-first", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--log-dir", default="logs")
-    parser.add_argument("--save-dir", default=None)
-    parser.add_argument("--load-model", default=None)
-    parser.add_argument("--no-stdout-log", action="store_true")
-    parser.add_argument("--no-step-limit", action="store_true")
-    parser.add_argument("--guard-eval-episodes", type=int, default=8)
-    parser.add_argument("--guard-holdout-episodes", type=int, default=8)
-    parser.add_argument("--guard-max-steps", type=int, default=None)
-    parser.add_argument("--guard-min-delta", type=float, default=0.001)
-    parser.add_argument(
-        "--guard-min-training-timesteps",
-        type=int,
-        default=4096,
-        help=(
-            "Minimum candidate transitions before final-model verification. Shorter smoke "
-            "runs exit successfully but save only an explicitly unverified candidate."
-        ),
-    )
-    return parser
-
-
 def main(argv=None):
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.agent == "cnn":
+        try:
+            validate_cnn_board_size(args.board_size, CNN_DEFAULT_IMAGE_SIZE)
+            validate_cnn_channel_mode(args.cnn_channel_first)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     if args.torch_threads < 1:
         raise ValueError("--torch-threads must be at least 1")
@@ -419,22 +471,36 @@ def main(argv=None):
     if args.load_model:
         learning_rate = linear_schedule(args.learning_rate, args.final_learning_rate)
         clip_range = linear_schedule(args.clip_range, args.final_clip_range)
+        # Do not override observation_space with the raw VecEnv space here.
+        # SB3 legitimately wraps HWC image environments as CHW before checking
+        # the checkpoint, so forcing the pre-wrap HWC space creates a false
+        # mismatch and makes channel-last training impossible to resume.
+        load_overrides = {
+            "n_steps": args.n_steps,
+            "batch_size": args.batch_size,
+            "n_epochs": args.n_epochs,
+            "gamma": args.gamma,
+            "ent_coef": args.ent_coef,
+            "learning_rate": learning_rate,
+            "clip_range": clip_range,
+            "tensorboard_log": str(log_dir),
+        }
+        if args.agent == "mlp":
+            # Repository MLP checkpoints predate the Gymnasium migration. Their
+            # Box spaces are semantically identical but fail class-based equality;
+            # this narrow legacy override is safe for the fixed MLP layout. CNN,
+            # especially HWC input, must keep SB3's real transpose-aware space.
+            load_overrides.update(
+                {
+                    "observation_space": env.observation_space,
+                    "action_space": env.action_space,
+                }
+            )
         model = MaskablePPO.load(
             args.load_model,
             env=env,
             device=device,
-            custom_objects={
-                "observation_space": env.observation_space,
-                "action_space": env.action_space,
-                "n_steps": args.n_steps,
-                "batch_size": args.batch_size,
-                "n_epochs": args.n_epochs,
-                "gamma": args.gamma,
-                "ent_coef": args.ent_coef,
-                "learning_rate": learning_rate,
-                "clip_range": clip_range,
-                "tensorboard_log": str(log_dir),
-            },
+            custom_objects=load_overrides,
         )
         model.verbose = 1
     else:
@@ -584,6 +650,9 @@ def main(argv=None):
                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "agent": args.agent,
                     "board_size": args.board_size,
+                    "cnn_channel_first": (
+                        bool(args.cnn_channel_first) if args.agent == "cnn" else None
+                    ),
                     "load_model": args.load_model,
                     "decision": decision,
                     "baseline": baseline,
@@ -617,14 +686,15 @@ def main(argv=None):
                         candidate_path,
                         embedded_guard_report=report,
                     )
-                    model = MaskablePPO.load(
+                    # Restore serialized policy/optimizer parameters in-place.
+                    # For HWC input, constructing a new algorithm with the raw
+                    # env creates a false HWC/CHW space mismatch.  The CLI exits
+                    # immediately after writing the rejection report, so its
+                    # advanced counters/schedules are neither reused nor saved.
+                    model.set_parameters(
                         baseline_checkpoint,
-                        env=env,
+                        exact_match=True,
                         device=device,
-                        custom_objects={
-                            "observation_space": env.observation_space,
-                            "action_space": env.action_space,
-                        },
                     )
                 write_json_atomic(report_path, report)
                 print(

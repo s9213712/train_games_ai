@@ -8,6 +8,52 @@ import numpy as np
 from snake_game import SnakeGame
 
 
+CNN_DEFAULT_IMAGE_SIZE = 84
+CNN_MIN_IMAGE_SIZE = 36
+
+
+def validate_cnn_board_size(board_size, image_size=CNN_DEFAULT_IMAGE_SIZE):
+    """Validate that one board cell maps to an exact CNN image block.
+
+    The observation renderer uses integer repetition rather than interpolation.
+    Requiring an exact divisor prevents an advertised ``image_size`` from
+    silently producing a smaller tensor.  Three is the smallest board that can
+    contain SnakeGame's three-cell initial snake.
+    """
+
+    if isinstance(image_size, bool) or not isinstance(image_size, (int, np.integer)):
+        raise ValueError("CNN image_size must be an integer")
+    image_size = int(image_size)
+    if image_size < CNN_MIN_IMAGE_SIZE:
+        raise ValueError(
+            f"CNN image_size must be at least {CNN_MIN_IMAGE_SIZE} for CnnPolicy; "
+            f"got {image_size}"
+        )
+    if isinstance(board_size, bool) or not isinstance(board_size, (int, np.integer)):
+        raise ValueError("CNN board_size must be an integer")
+    board_size = int(board_size)
+    compatible = [
+        size for size in range(3, image_size + 1) if image_size % size == 0
+    ]
+    if board_size not in compatible:
+        values = ", ".join(str(size) for size in compatible)
+        raise ValueError(
+            f"CNN board_size={board_size} is incompatible with image_size={image_size}; "
+            f"board_size must divide {image_size} exactly. Compatible values: {values}"
+        )
+    return board_size
+
+
+def validate_cnn_channel_mode(channel_first):
+    """Accept only explicit CHW (True) or HWC (False) observation modes."""
+
+    if not isinstance(channel_first, (bool, np.bool_)):
+        raise ValueError(
+            "CNN channel_first must be a boolean: True for CHW or False for HWC"
+        )
+    return bool(channel_first)
+
+
 class BaseSnakeEnv(gym.Env, ABC):
     metadata = {"render_modes": ["human"], "render_fps": 20}
 
@@ -333,12 +379,33 @@ class BaseSnakeEnv(gym.Env, ABC):
 
 
 class SnakeCnnEnv(BaseSnakeEnv):
-    def __init__(self, *args, image_size=84, channel_first=False, **kwargs):
-        self.image_size = image_size
-        self.channel_first = bool(channel_first)
+    def __init__(
+        self,
+        *args,
+        image_size=CNN_DEFAULT_IMAGE_SIZE,
+        channel_first=False,
+        **kwargs,
+    ):
+        # ``BaseSnakeEnv`` historically allowed positional construction, for
+        # example ``SnakeCnnEnv(7, 12)`` for seed/board size.  Do not also add a
+        # keyword board size in that case: doing so makes Python report
+        # ``multiple values for argument 'board_size'`` before the environment
+        # can start.  Validate and replace whichever form the caller used.
+        if len(args) >= 2 and "board_size" in kwargs:
+            raise TypeError("SnakeCnnEnv got multiple values for argument 'board_size'")
+
+        board_size = args[1] if len(args) >= 2 else kwargs.get("board_size", 12)
+        validated_board_size = validate_cnn_board_size(board_size, image_size)
+        if len(args) >= 2:
+            args = (*args[:1], validated_board_size, *args[2:])
+        else:
+            kwargs["board_size"] = validated_board_size
+
+        # validate_cnn_board_size performs the strict integral type check for
+        # image_size as well as the shape compatibility check.
+        self.image_size = int(image_size)
+        self.channel_first = validate_cnn_channel_mode(channel_first)
         super().__init__(*args, **kwargs)
-        if self.image_size % self.board_size != 0:
-            raise ValueError("image_size must be divisible by board_size for CNN observations")
 
     def _make_observation_space(self):
         shape = (

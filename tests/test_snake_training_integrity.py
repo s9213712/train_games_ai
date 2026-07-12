@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import subprocess
 import sys
 import threading
@@ -86,6 +87,49 @@ def _write_dashboard_bundle(path, metadata, model_payload=b"placeholder model we
     with zipfile.ZipFile(path, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
         bundle.writestr("model.zip", model_payload)
         bundle.writestr("metadata.json", json.dumps(metadata))
+
+
+def _accepted_dashboard_guard(benchmark, *, development_episodes=4):
+    objective = float(benchmark["objective"])
+    baseline = {
+        "episodes": development_episodes,
+        "objective": objective - 1.0,
+        "avg_score": 0.0,
+        "avg_food": 0.0,
+        "avg_reward": 0.0,
+    }
+    candidate = {
+        **baseline,
+        "objective": objective,
+        "avg_score": 1.0,
+        "avg_food": 1.0,
+    }
+    protocol = benchmark["protocol"]
+    return {
+        "accepted": True,
+        "promoted_to_best": True,
+        "attempted_timesteps": 8,
+        "episodes": development_episodes,
+        "baseline": baseline,
+        "candidate": candidate,
+        "baseline_model_sha256": "0" * 64,
+        "candidate_model_sha256": "f" * 64,
+        "decision": {"accepted": True, "required_delta": 0.001},
+        "promotion_basis": FIXED_HOLDOUT_KIND,
+        "holdout_protocol": protocol,
+        "holdout_seed_base": protocol["seed_base"],
+        "holdout_episodes": protocol["episodes"],
+        "holdout_max_steps": protocol["max_steps"],
+        "holdout_baseline": dict(benchmark["metrics"]),
+        "holdout_candidate": dict(benchmark["metrics"]),
+    }
+
+
+def _write_fingerprinted_dashboard_bundle(path, metadata, model_payload=b"test model"):
+    model_sha256 = hashlib.sha256(model_payload).hexdigest()
+    metadata["model_sha256"] = model_sha256
+    metadata["guard"]["candidate_model_sha256"] = model_sha256
+    _write_dashboard_bundle(path, metadata, model_payload)
 
 
 def test_mlp_factory_never_receives_cnn_only_channel_first():
@@ -373,12 +417,14 @@ def test_fixed_holdout_best_promotion_ignores_incomparable_development_score(
     protocol = dashboard._holdout_protocol()
     dashboard.guard_benchmark = _fixed_benchmark(dashboard, objective=5.0)
     dashboard.best_guard_objective = 5.0
+    dashboard.trained_steps = 8
     writes = []
-    monkeypatch.setattr(
-        dashboard,
-        "_write_model_bundle",
-        lambda destination, metadata: writes.append((destination, metadata)),
-    )
+
+    def write_bundle(destination, metadata):
+        writes.append((destination, metadata))
+        _write_fingerprinted_dashboard_bundle(destination, metadata)
+
+    monkeypatch.setattr(dashboard, "_write_model_bundle", write_bundle)
 
     # A hypothetical very high drifting development result is irrelevant: the
     # fixed holdout objective is lower, so protected best must not be replaced.
@@ -392,7 +438,14 @@ def test_fixed_holdout_best_promotion_ignores_incomparable_development_score(
     assert dashboard._promote_fixed_holdout_best(
         protocol=protocol,
         metrics={**_metric(5.1), "episodes": 8},
-        guard={"candidate": _metric(-1000.0)},
+        guard=_accepted_dashboard_guard(
+            {
+                "kind": FIXED_HOLDOUT_KIND,
+                "protocol": protocol,
+                "objective": 5.1,
+                "metrics": {**_metric(5.1), "episodes": 8},
+            }
+        ),
     ) is True
     assert len(writes) == 1
     assert dashboard.best_guard_objective == 5.1
@@ -417,25 +470,189 @@ def test_protected_bundle_is_discovered_and_model_reloaded_after_restart(
         }
     )
     first._ensure_model()
+    first.model.learn(total_timesteps=8, reset_num_timesteps=False, progress_bar=False)
     expected = {
         key: value.detach().cpu().clone()
         for key, value in first.model.policy.state_dict().items()
     }
     protocol = first._holdout_protocol()
-    metrics = {**_metric(3.0), "episodes": 8, "episode_results": []}
+    metrics = first._evaluate_model_score(
+        first.model,
+        seed_base=protocol["seed_base"],
+        episodes=protocol["episodes"],
+        max_steps=protocol["max_steps"],
+        eval_config=protocol["eval_config"],
+    )
+    benchmark = {
+        "kind": FIXED_HOLDOUT_KIND,
+        "protocol": protocol,
+        "objective": metrics["objective"],
+        "metrics": metrics,
+    }
     assert first._promote_fixed_holdout_best(
         protocol=protocol,
         metrics=metrics,
-        guard={"accepted": True},
+        guard=_accepted_dashboard_guard(benchmark),
     ) is True
     first.close()
 
     restarted = TrainingDashboard()
-    assert restarted.best_guard_objective == 3.0
+    assert restarted.best_guard_objective == metrics["objective"]
     assert restarted.resume_best_bundle == best_path
     restarted._ensure_model()
     for key, value in restarted.model.policy.state_dict().items():
         assert torch.equal(value.detach().cpu(), expected[key])
+    restarted.close()
+
+    # Even a self-consistent model+metadata rewrite cannot be served merely by
+    # updating hashes: startup recomputes the fixed validation behavior.
+    with zipfile.ZipFile(best_path) as persisted:
+        model_payload = persisted.read("model.zip")
+        forged_metadata = json.loads(persisted.read("metadata.json"))
+    forged_metrics = dict(forged_metadata["guard_benchmark"]["metrics"])
+    forged_metrics["avg_score"] = float(forged_metrics["avg_score"]) + 10.0
+    forged_metrics["objective"] = float(forged_metrics["objective"]) + 10.0
+    forged_metadata["guard_benchmark"]["metrics"] = forged_metrics
+    forged_metadata["guard_benchmark"]["objective"] = forged_metrics["objective"]
+    forged_metadata["guard"]["holdout_candidate"] = dict(forged_metrics)
+    forged_metadata["guard"]["holdout_baseline"] = dict(forged_metrics)
+    _write_fingerprinted_dashboard_bundle(
+        best_path,
+        forged_metadata,
+        model_payload,
+    )
+
+    forged = TrainingDashboard()
+    assert forged.resume_best_bundle == best_path
+    forged._ensure_model()
+    assert forged.resume_best_bundle is None
+    assert forged.guard_benchmark == {}
+    assert not best_path.exists()
+    assert "fixed-holdout revalidation" in forged.last_event
+    forged.close()
+
+
+def test_current_bundle_rejects_embedded_model_replacement_and_future_format():
+    best_path = web_dashboard.BEST_MODEL_PATH
+    builder = TrainingDashboard()
+    benchmark = _fixed_benchmark(builder, objective=2.0)
+    builder.guard_benchmark = benchmark
+    builder.holdout_protocol = dict(benchmark["protocol"])
+    builder.best_guard_objective = 2.0
+    builder.trained_steps = 8
+    metadata = builder._model_bundle_metadata(
+        extra={"guard": _accepted_dashboard_guard(benchmark)}
+    )
+    builder.close()
+    _write_fingerprinted_dashboard_bundle(best_path, metadata, b"original model")
+
+    with zipfile.ZipFile(best_path) as persisted:
+        unchanged_metadata = json.loads(persisted.read("metadata.json"))
+    _write_dashboard_bundle(best_path, unchanged_metadata, b"replaced model")
+    replaced = TrainingDashboard()
+    assert replaced.resume_best_bundle is None
+    assert not best_path.exists()
+    assert "fingerprint or promotion provenance" in replaced.last_event
+    replaced.close()
+
+    future_metadata = dict(metadata)
+    future_metadata["format_version"] = web_dashboard.DASHBOARD_BUNDLE_FORMAT_VERSION + 1
+    _write_fingerprinted_dashboard_bundle(best_path, future_metadata, b"future model")
+    future = TrainingDashboard()
+    assert future.resume_best_bundle is None
+    assert not best_path.exists()
+    assert "legacy or stale format" in future.last_event
+    future.close()
+
+
+def test_real_cnn_bundle_rejects_self_consistent_tampered_architecture_metadata():
+    best_path = web_dashboard.BEST_MODEL_PATH
+    builder = TrainingDashboard()
+    builder._merge_config(
+        {
+            "agent": "cnn",
+            "model_profile": "new",
+            "board_size": 6,
+            "cnn_channel_first": False,
+            "num_envs": 1,
+            "n_steps": 8,
+            "batch_size": 8,
+            "n_epochs": 1,
+            "device": "cpu",
+        }
+    )
+    builder._ensure_model()
+    builder.model.learn(total_timesteps=8, reset_num_timesteps=False, progress_bar=False)
+    protocol = builder._holdout_protocol()
+    metrics = {
+        "episodes": protocol["episodes"],
+        "avg_score": 0.0,
+        "avg_food": 0.0,
+        "avg_reward": 0.0,
+        "objective": 0.0,
+        "episode_results": [],
+    }
+    benchmark = {
+        "kind": FIXED_HOLDOUT_KIND,
+        "protocol": protocol,
+        "objective": 0.0,
+        "metrics": metrics,
+    }
+    assert builder._promote_fixed_holdout_best(
+        protocol=protocol,
+        metrics=metrics,
+        guard=_accepted_dashboard_guard(benchmark),
+    )
+    snapshot = builder._read_bundle_snapshot(best_path)
+    provenance = builder._validated_bundle_provenance(
+        snapshot["metadata"],
+        model_sha256=snapshot["model_sha256"],
+    )
+    assert builder._validate_loaded_model_architecture(builder.model, provenance)
+
+    with zipfile.ZipFile(best_path) as persisted:
+        model_payload = persisted.read("model.zip")
+        metadata = json.loads(persisted.read("metadata.json"))
+    tampered_architecture = {
+        "cnn_channels": "16,32",
+        "cnn_kernel_sizes": "5,3",
+        "cnn_strides": "2,1",
+        "cnn_features_dim": 256,
+    }
+    metadata["config"].update(tampered_architecture)
+    metadata["guard_benchmark"]["protocol"]["eval_config"].update(
+        tampered_architecture
+    )
+    metadata["guard"]["holdout_protocol"] = json.loads(
+        json.dumps(metadata["guard_benchmark"]["protocol"])
+    )
+    tampered_provenance = builder._validated_bundle_provenance(
+        metadata,
+        model_sha256=snapshot["model_sha256"],
+    )
+    assert tampered_provenance
+    builder._merge_config(tampered_architecture)
+    with pytest.raises(ValueError, match="do not match metadata architecture"):
+        builder._validate_loaded_model_architecture(
+            builder.model,
+            tampered_provenance,
+        )
+    builder.close()
+    _write_fingerprinted_dashboard_bundle(best_path, metadata, model_payload)
+
+    restarted = TrainingDashboard()
+    assert restarted.resume_best_bundle == best_path
+    assert restarted.config["cnn_channels"] == "16,32"
+    restarted._ensure_model()
+
+    assert restarted.resume_best_bundle is None
+    assert restarted.guard_benchmark == {}
+    assert not best_path.exists()
+    assert "fixed-holdout revalidation" in restarted.last_event
+    assert restarted.model.policy.features_extractor.architecture["channels"] == (
+        16,
+        32,
+    )
     restarted.close()
 
 
@@ -496,6 +713,15 @@ def test_startup_quarantines_legacy_protected_bundle_even_with_weights_and_guard
             else pytest.fail(f"unexpected model source: {model_path}")
         ),
     )
+    monkeypatch.setattr(
+        dashboard,
+        "_validate_loaded_model_architecture",
+        lambda model, *_args, **_kwargs: (
+            True
+            if model is fallback_model
+            else pytest.fail("unexpected fallback model was attested")
+        ),
+    )
     dashboard._ensure_model()
     assert dashboard.model is fallback_model
     assert dashboard.trained_steps == 23
@@ -509,14 +735,15 @@ def test_startup_quarantines_v2_bundle_with_noncurrent_holdout_protocol(tmp_path
     builder = TrainingDashboard()
     benchmark = _fixed_benchmark(builder, objective=4.0)
     benchmark["protocol"]["seed_base"] += 1
+    builder.trained_steps = 8
     metadata = builder._model_bundle_metadata(
         extra={
             "guard_benchmark": benchmark,
-            "guard": {"accepted": True, "promoted_to_best": True},
+            "guard": _accepted_dashboard_guard(benchmark),
         }
     )
     builder.close()
-    _write_dashboard_bundle(best_path, metadata)
+    _write_fingerprinted_dashboard_bundle(best_path, metadata)
 
     dashboard = TrainingDashboard()
 

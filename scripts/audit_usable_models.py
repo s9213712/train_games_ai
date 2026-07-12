@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
+import shutil
 import sys
 import tempfile
 import time
@@ -197,101 +199,334 @@ def audit_chess() -> dict:
     }
 
 
-def _bundle_guard(metadata: dict) -> dict:
-    guard = metadata.get("guard")
-    if isinstance(guard, dict):
-        return dict(guard)
-    for row in reversed(list(metadata.get("history") or [])):
-        if isinstance(row, dict) and isinstance(row.get("guard"), dict):
-            return dict(row["guard"])
-    return {}
-
-
-def audit_snake(episodes: int) -> dict:
-    snake_dir = ROOT / "snake-ai" / "main"
-    dashboard_module = load_module(
-        "usable_model_audit_snake",
-        snake_dir / "web_dashboard.py",
-        snake_dir,
-        clear=("cnn_features", "snake_env", "snake_game", "train"),
-    )
-    checkpoint = ROOT / "snake-ai" / "runtime" / "snake_policy.best.snakeai.zip"
-    if not checkpoint.exists():
-        return {
-            "checkpoint": str(checkpoint),
-            "artifact_exists": False,
-            "safe_to_serve": True,
-            "training_verified": False,
-            "note": "no protected bundle; dashboard creates or loads its explicitly configured baseline",
-        }
+def _read_snake_bundle_metadata(path: Path) -> tuple[dict, str | None]:
+    """Read only the small metadata member from a Snake dashboard bundle."""
 
     try:
-        with zipfile.ZipFile(checkpoint) as bundle:
+        with zipfile.ZipFile(path) as bundle:
+            info = bundle.getinfo("metadata.json")
+            if info.file_size > 1024 * 1024:
+                raise ValueError("metadata.json exceeds 1 MiB")
             metadata = json.loads(bundle.read("metadata.json").decode("utf-8"))
-    except (OSError, KeyError, UnicodeDecodeError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        if not isinstance(metadata, dict):
+            raise ValueError("metadata.json is not an object")
+    except (
+        OSError,
+        KeyError,
+        UnicodeDecodeError,
+        ValueError,
+        zipfile.BadZipFile,
+        json.JSONDecodeError,
+    ) as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+    return metadata, None
+
+
+def _stage_snake_audit_tree(source_root: Path, destination_root: Path) -> dict:
+    """Create a minimal, private runtime tree for the production Snake loader.
+
+    Importing ``web_dashboard`` constructs its singleton immediately.  The
+    singleton is intentionally allowed to migrate or quarantine bundles, but
+    only after all relevant code and runtime artifacts have been copied below a
+    temporary root.  No production checkpoint is opened for writing, renamed,
+    or unlinked by the audit.
+    """
+
+    source_main = source_root / "main"
+    destination_main = destination_root / "main"
+    destination_runtime = destination_root / "runtime"
+    destination_protected = destination_runtime / "protected_best"
+    destination_main.mkdir(parents=True, exist_ok=True)
+    destination_protected.mkdir(parents=True, exist_ok=True)
+
+    for source in source_main.glob("*.py"):
+        shutil.copy2(source, destination_main / source.name)
+
+    # The dashboard's production fallback chain is part of the runtime being
+    # audited.  Copy the CPU originals and the full-board CNN into the private
+    # tree as well; otherwise an audit with no protected checkpoint silently
+    # exercises a newly initialized policy instead of what production serves.
+    fallback_specs = {
+        "mlp_repo_original": Path(
+            "main/original_models/trained_models_mlp/ppo_snake_final.zip"
+        ),
+        "cnn_repo_original": Path(
+            "main/original_models/trained_models_cnn/ppo_snake_final.zip"
+        ),
+        "cnn_fullboard_12x12": Path(
+            "main/trained_models_cnn_oracle_bc/ppo_snake_bc_final_12x12.zip"
+        ),
+    }
+
+    legacy_relative = Path("runtime/snake_policy.best.snakeai.zip")
+    protected_relatives = [
+        path.relative_to(source_root)
+        for path in sorted(
+            (source_root / "runtime" / "protected_best").glob(
+                "snake_policy.*.best.snakeai.zip"
+            )
+        )
+        if path.is_file()
+    ]
+    source_relatives = list(protected_relatives)
+    if (source_root / legacy_relative).is_file():
+        source_relatives.append(legacy_relative)
+
+    for relative in source_relatives:
+        destination = destination_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_root / relative, destination)
+
+    fallback_artifacts = []
+    for name, relative in fallback_specs.items():
+        source = source_root / relative
+        row = {
+            "name": name,
+            "relative": relative,
+            "source_exists": source.is_file(),
+            "sha256": None,
+            "staged_verified": False,
+        }
+        if source.is_file():
+            destination = destination_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            source_digest = _file_sha256(source)
+            staged_digest = _file_sha256(destination)
+            if source_digest != staged_digest:
+                raise OSError(f"Snake fallback copy verification failed: {relative}")
+            row.update({"sha256": source_digest, "staged_verified": True})
+        fallback_artifacts.append(row)
+
+    return {
+        "source_relatives": source_relatives,
+        "protected_relatives": protected_relatives,
+        "legacy_relative": legacy_relative,
+        "fallback_artifacts": fallback_artifacts,
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _new_snake_baseline_model(dashboard_module, dashboard):
+    """Construct the loader's fresh, same-architecture PPO initialization."""
+
+    seed = int(dashboard.config["seed"])
+    dashboard_module.random.seed(seed)
+    dashboard_module.torch.manual_seed(seed)
+    return dashboard_module.MaskablePPO(
+        dashboard._policy(),
+        dashboard.train_env,
+        device="cpu",
+        verbose=0,
+        n_steps=dashboard.config["n_steps"],
+        batch_size=dashboard.config["batch_size"],
+        n_epochs=dashboard.config["n_epochs"],
+        gamma=dashboard.config["gamma"],
+        learning_rate=dashboard.config["learning_rate"],
+        clip_range=dashboard.config["clip_range"],
+        ent_coef=dashboard.config["ent_coef"],
+        policy_kwargs=(
+            dashboard._cnn_policy_kwargs()
+            if dashboard.config["agent"] == "cnn"
+            else None
+        ),
+    )
+
+
+def _snake_original_checkpoint(
+    local_path: Path,
+    *,
+    source_root: Path,
+    isolated_root: Path,
+    staged: dict,
+) -> tuple[Path, bool]:
+    """Map a private loader selection back to its production source path."""
+
+    relative = local_path.relative_to(isolated_root)
+    if relative in staged["protected_relatives"]:
+        return source_root / relative, False
+    # The only file the isolated loader can create at a new protected path is a
+    # validated migration of the copied legacy-global bundle.
+    return source_root / staged["legacy_relative"], True
+
+
+def _audit_selected_snake_bundle(
+    dashboard_module,
+    dashboard,
+    *,
+    local_path: Path,
+    source_path: Path,
+    metadata: dict,
+    episodes: int,
+    migrated_from_legacy: bool,
+) -> dict:
+    model_sha256 = dashboard._read_bundle_model_sha256(local_path)
+    provenance = dashboard._validated_bundle_provenance(
+        metadata,
+        model_sha256=model_sha256,
+    )
+    benchmark = dict(provenance.get("benchmark") or {})
+    config = metadata.get("config") if isinstance(metadata, dict) else None
+    base = {
+        "checkpoint": str(source_path),
+        "runtime_checkpoint": str(local_path),
+        "runtime_kind": "protected",
+        "migrated_from_legacy": migrated_from_legacy,
+        "agent": (
+            str(config.get("agent"))
+            if isinstance(config, dict) and config.get("agent") in {"cnn", "mlp"}
+            else "unknown"
+        ),
+        "protocol_id": (
+            dashboard._protocol_id(benchmark["protocol"]) if benchmark else None
+        ),
+        "model_sha256": model_sha256,
+    }
+    schema_current = bool(dashboard._has_resumable_bundle_format(metadata))
+    if not provenance or not benchmark or not isinstance(config, dict):
         return {
-            "checkpoint": str(checkpoint),
-            "artifact_exists": True,
-            "safe_to_serve": False,
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": True,
             "training_verified": False,
-            "error": f"{type(exc).__name__}: {exc}",
+            "checkpoint_schema_current": schema_current,
+            "accepted_training_evidence": False,
+            "loader_disposition": (
+                "production provenance validator rejected metadata/model identity "
+                "before policy loading"
+            ),
         }
 
-    original_best_path = dashboard_module.BEST_MODEL_PATH
-    with tempfile.TemporaryDirectory() as tmpdir:
-        dashboard_module.BEST_MODEL_PATH = Path(tmpdir) / "no-implicit-best.snakeai.zip"
-        dashboard = dashboard_module.TrainingDashboard()
-        try:
-            dashboard.config = dict(dashboard_module.DEFAULT_CONFIG)
-            dashboard.resume_best_bundle = None
-            dashboard.guard_benchmark = {}
-            dashboard.holdout_protocol = {}
-            dashboard.best_guard_objective = float("-inf")
-            bundle_config = dict(metadata.get("config") or {})
-            bundle_config.update({"model_profile": "new", "device": "cpu", "num_envs": 1})
-            dashboard._merge_config(bundle_config)
-            dashboard._ensure_model()
-            eval_config = dict(dashboard.config)
-            seed_base = int(eval_config.get("seed", 7)) + 7_000_000
-            max_steps = min(1_200, max(120, int(eval_config.get("guard_eval_steps", 600))))
-            baseline = dashboard._evaluate_model_score(
-                dashboard.model,
-                seed_base=seed_base,
-                episodes=episodes,
-                max_steps=max_steps,
-                eval_config=eval_config,
-            )
-            candidate_model = dashboard._load_model_from_bundle(
-                checkpoint,
-                dashboard.train_env,
-                "cpu",
-            )
-            candidate = dashboard._evaluate_model_score(
-                candidate_model,
-                seed_base=seed_base,
-                episodes=episodes,
-                max_steps=max_steps,
-                eval_config=eval_config,
-            )
-            benchmark = dashboard._validated_guard_benchmark(metadata)
-        finally:
-            dashboard.close()
-            dashboard_module.BEST_MODEL_PATH = original_best_path
+    expected_path = dashboard._protected_best_path(benchmark["protocol"])
+    if local_path != expected_path:
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": True,
+            "training_verified": False,
+            "checkpoint_schema_current": False,
+            "accepted_training_evidence": False,
+            "loader_disposition": "rejected protected namespace mismatch",
+        }
 
+    runtime_config = dict(dashboard_module.DEFAULT_CONFIG)
+    runtime_config.update(config)
+    # Device and vector count do not participate in the fixed-validation
+    # protocol.  Keeping this audit on one CPU environment makes the comparison
+    # reproducible without changing which protected policy the real loader picks.
+    runtime_config.update({"device": "cpu", "num_envs": 1})
+    try:
+        dashboard.reset(runtime_config)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": True,
+            "training_verified": False,
+            "checkpoint_schema_current": False,
+            "accepted_training_evidence": False,
+            "loader_disposition": f"loader rejected configuration: {type(exc).__name__}: {exc}",
+        }
+    if (
+        dashboard.resume_best_bundle != local_path
+        or getattr(dashboard, "resume_best_model_sha256", None) != model_sha256
+    ):
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": True,
+            "training_verified": False,
+            "checkpoint_schema_current": False,
+            "accepted_training_evidence": False,
+            "loader_disposition": "loader selected baseline fallback",
+        }
+
+    # Restoring a bundle deliberately restores its complete training config.
+    # Device, vector count, rollout length, and batch size are operational knobs
+    # outside the policy architecture and fixed-validation namespace, so bound
+    # them again only after the real loader has made its selection.
+    audit_n_steps = min(2048, max(8, int(dashboard.config["n_steps"])))
+    audit_batch_size = min(
+        audit_n_steps,
+        max(8, int(dashboard.config["batch_size"])),
+    )
+    dashboard.update_config(
+        {
+            "device": "cpu",
+            "num_envs": 1,
+            "n_steps": audit_n_steps,
+            "batch_size": audit_batch_size,
+        }
+    )
+    try:
+        dashboard._ensure_model()
+    except Exception as exc:
+        # The production loader catches its supported archive/load failures and
+        # falls back.  Anything escaping it is an evaluator/runtime failure.
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": False,
+            "training_verified": False,
+            "checkpoint_schema_current": False,
+            "accepted_training_evidence": False,
+            "loader_disposition": f"policy load failed: {type(exc).__name__}: {exc}",
+        }
+    if (
+        dashboard.resume_best_bundle != local_path
+        or getattr(dashboard, "resume_best_model_sha256", None) != model_sha256
+        or not local_path.exists()
+    ):
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": True,
+            "training_verified": False,
+            "checkpoint_schema_current": False,
+            "accepted_training_evidence": False,
+            "loader_disposition": "policy weights failed to load; baseline fallback selected",
+        }
+
+    eval_config = dict(dashboard.config)
+    seed_base = int(eval_config.get("seed", 7)) + 7_000_000
+    max_steps = min(
+        1_200,
+        max(120, int(eval_config.get("guard_eval_steps", 600))),
+    )
+    candidate = dashboard._evaluate_model_score(
+        dashboard.model,
+        seed_base=seed_base,
+        episodes=episodes,
+        max_steps=max_steps,
+        eval_config=eval_config,
+    )
+    baseline_model = _new_snake_baseline_model(dashboard_module, dashboard)
+    baseline = dashboard._evaluate_model_score(
+        baseline_model,
+        seed_base=seed_base,
+        episodes=episodes,
+        max_steps=max_steps,
+        eval_config=eval_config,
+    )
     objective_delta = float(candidate["objective"]) - float(baseline["objective"])
     food_delta = float(candidate["avg_food"]) - float(baseline["avg_food"])
     independently_better = objective_delta > 1e-5 and food_delta >= 0.0
     safe_to_serve = objective_delta >= -1e-12 and food_delta >= 0.0
-    guard = _bundle_guard(metadata)
-    schema_current = int(metadata.get("format_version", 0)) >= 2 and bool(benchmark)
-    accepted_evidence = (
-        guard.get("accepted") is True
-        and int(metadata.get("trained_steps", 0)) > 0
-        and float(benchmark.get("objective", -math.inf)) > -math.inf
-    )
+    # Do not duplicate the dashboard's evidence rules here.  The production
+    # validator binds the exact embedded model bytes to the accepted guard,
+    # development comparison, fixed holdout, and positive attempted training.
+    accepted_evidence = bool(provenance)
     return {
-        "checkpoint": str(checkpoint),
-        "artifact_exists": True,
+        **base,
+        "runtime_selected": True,
+        "loader_disposition": "served protected policy",
         "checkpoint_schema_current": schema_current,
         "accepted_training_evidence": accepted_evidence,
         "audit_protocol": {
@@ -308,11 +543,456 @@ def audit_snake(episodes: int) -> dict:
             "strictly_better": independently_better,
         },
         "safe_to_serve": safe_to_serve,
-        "training_verified": bool(schema_current and accepted_evidence and independently_better),
+        "training_verified": bool(
+            schema_current and accepted_evidence and independently_better
+        ),
+    }
+
+
+def _audit_snake_runtime_fallback(
+    dashboard_module,
+    dashboard,
+    *,
+    source_root: Path,
+    isolated_root: Path,
+    agent: str,
+    episodes: int,
+) -> dict:
+    """Exercise the production no-protected-checkpoint path for one agent."""
+
+    profile = "repo_original" if agent == "mlp" else "fullboard_12x12"
+    base = {
+        "checkpoint": None,
+        "runtime_checkpoint": None,
+        "runtime_kind": "fallback",
+        "migrated_from_legacy": False,
+        "agent": agent,
+        "protocol_id": None,
+        "checkpoint_schema_current": False,
+        "accepted_training_evidence": False,
+        "training_verified": False,
+    }
+    runtime_config = dict(dashboard_module.DEFAULT_CONFIG)
+    runtime_config.update(
+        {
+            "agent": agent,
+            "model_profile": profile,
+            "board_size": 12,
+            "device": "cpu",
+            "num_envs": 1,
+            "n_steps": 64,
+            "batch_size": 64,
+        }
+    )
+    try:
+        dashboard.reset(runtime_config)
+    except Exception as exc:
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": False,
+            "loader_disposition": (
+                f"{agent} fallback configuration failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if dashboard.resume_best_bundle is not None:
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": False,
+            "loader_disposition": (
+                f"{agent} fallback audit unexpectedly selected a protected bundle"
+            ),
+            "error": "protected policy selected while auditing fallback",
+        }
+
+    try:
+        local_path = dashboard._initial_model_path("cpu")
+    except Exception as exc:
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": False,
+            "loader_disposition": (
+                f"{agent} fallback resolution failed: {type(exc).__name__}: {exc}"
+            ),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if local_path is None or not Path(local_path).is_file():
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": False,
+            "loader_disposition": f"{agent} production fallback artifact is absent",
+            "error": f"no {profile} fallback artifact",
+        }
+
+    local_path = Path(local_path)
+    try:
+        relative = local_path.relative_to(isolated_root)
+        source_path = source_root / relative
+    except ValueError:
+        return {
+            **base,
+            "runtime_checkpoint": str(local_path),
+            "runtime_selected": False,
+            "safe_to_serve": False,
+            "loader_disposition": f"{agent} fallback escaped the isolated audit tree",
+            "error": "fallback path is outside isolated tree",
+        }
+    base.update(
+        {
+            "checkpoint": str(source_path),
+            "runtime_checkpoint": str(local_path),
+            "fallback_profile": profile,
+            "artifact_sha256": _file_sha256(local_path),
+        }
+    )
+
+    try:
+        dashboard._ensure_model()
+    except Exception as exc:
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": False,
+            "loader_disposition": (
+                f"{agent} fallback failed to load: {type(exc).__name__}: {exc}"
+            ),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    loader_event = str(getattr(dashboard, "last_event", ""))
+    runtime_selected = bool(
+        dashboard.model is not None
+        and dashboard.resume_best_bundle is None
+        and "loaded original model from" in loader_event
+    )
+    if not runtime_selected:
+        return {
+            **base,
+            "runtime_selected": False,
+            "safe_to_serve": False,
+            "loader_disposition": (
+                f"{agent} loader did not confirm the staged fallback: {loader_event}"
+            ),
+            "error": "production loader did not select fallback artifact",
+        }
+
+    eval_config = dict(dashboard.config)
+    seed_base = int(eval_config.get("seed", 7)) + (
+        7_100_000 if agent == "mlp" else 7_200_000
+    )
+    max_steps = min(
+        1_200,
+        max(120, int(eval_config.get("guard_eval_steps", 600))),
+    )
+    try:
+        candidate = dashboard._evaluate_model_score(
+            dashboard.model,
+            seed_base=seed_base,
+            episodes=episodes,
+            max_steps=max_steps,
+            eval_config=eval_config,
+        )
+        baseline_model = _new_snake_baseline_model(dashboard_module, dashboard)
+        baseline = dashboard._evaluate_model_score(
+            baseline_model,
+            seed_base=seed_base,
+            episodes=episodes,
+            max_steps=max_steps,
+            eval_config=eval_config,
+        )
+    except Exception as exc:
+        return {
+            **base,
+            "runtime_selected": True,
+            "safe_to_serve": False,
+            "loader_disposition": (
+                f"served {agent} fallback but behavior evaluation failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    objective_delta = float(candidate["objective"]) - float(baseline["objective"])
+    food_delta = float(candidate["avg_food"]) - float(baseline["avg_food"])
+    independently_better = objective_delta > 1e-5 and food_delta >= 0.0
+    safe_to_serve = objective_delta >= -1e-12 and food_delta >= 0.0
+    return {
+        **base,
+        "runtime_selected": True,
+        "loader_disposition": f"served production {agent} {profile} fallback",
+        "audit_protocol": {
+            "seed_base": seed_base,
+            "episodes": episodes,
+            "max_steps": max_steps,
+            "fresh_same_architecture_baseline": True,
+        },
+        "independent_comparison": {
+            "baseline": snake_metric_summary(baseline),
+            "candidate": snake_metric_summary(candidate),
+            "objective_delta": round(objective_delta, 5),
+            "food_delta": round(food_delta, 5),
+            "strictly_better": independently_better,
+        },
+        "safe_to_serve": safe_to_serve,
+    }
+
+
+def _snake_agent_summary(runtime_rows: list[dict]) -> dict:
+    """Require an actual, safe loader selection for both policy families."""
+
+    summary = {}
+    for agent in ("mlp", "cnn"):
+        rows = [row for row in runtime_rows if row.get("agent") == agent]
+        selected = [row for row in rows if row.get("runtime_selected") is True]
+        runtime_selected = bool(selected)
+        summary[agent] = {
+            "audited_policies": len(rows),
+            "selected_policies": len(selected),
+            "runtime_selected": runtime_selected,
+            "safe_to_serve": runtime_selected
+            and all(row.get("safe_to_serve") is True for row in selected),
+            "training_verified": runtime_selected
+            and all(row.get("training_verified") is True for row in selected),
+        }
+    return summary
+
+
+def audit_snake(episodes: int) -> dict:
+    source_root = ROOT / "snake-ai"
+    legacy_source = source_root / "runtime" / "snake_policy.best.snakeai.zip"
+    with tempfile.TemporaryDirectory(prefix="snake-model-audit-") as tmpdir:
+        isolated_root = Path(tmpdir) / "snake-ai"
+        staged = _stage_snake_audit_tree(source_root, isolated_root)
+        source_artifacts = []
+        for relative in staged["source_relatives"]:
+            source_path = source_root / relative
+            metadata, error = _read_snake_bundle_metadata(source_path)
+            source_artifacts.append(
+                {
+                    "checkpoint": str(source_path),
+                    "layout": (
+                        "legacy_global"
+                        if relative == staged["legacy_relative"]
+                        else "protected_namespace"
+                    ),
+                    "metadata_readable": not bool(error),
+                    "metadata_error": error,
+                    "agent": (metadata.get("config") or {}).get("agent"),
+                    "runtime_disposition": "not selected",
+                }
+            )
+
+        isolated_main = isolated_root / "main"
+        dashboard_module = load_module(
+            "usable_model_audit_snake",
+            isolated_main / "web_dashboard.py",
+            isolated_main,
+            clear=("cnn_features", "snake_env", "snake_game", "train"),
+        )
+        dashboard = dashboard_module.dashboard
+        startup_local = (
+            Path(dashboard.resume_best_bundle)
+            if dashboard.resume_best_bundle is not None
+            else None
+        )
+        startup_source = None
+        if startup_local is not None:
+            startup_source, _migrated = _snake_original_checkpoint(
+                startup_local,
+                source_root=source_root,
+                isolated_root=isolated_root,
+                staged=staged,
+            )
+
+        # Startup may have migrated a validated legacy bundle or quarantined a
+        # copied artifact.  Audit every remaining protected policy by selecting
+        # its own exact config through TrainingDashboard.reset(), just as the
+        # production API does when switching MLP/CNN/protocol.
+        local_candidates = sorted(
+            (isolated_root / "runtime" / "protected_best").glob(
+                "snake_policy.*.best.snakeai.zip"
+            )
+        )
+        policies = []
+        try:
+            for local_path in local_candidates:
+                metadata, metadata_error = _read_snake_bundle_metadata(local_path)
+                source_path, migrated = _snake_original_checkpoint(
+                    local_path,
+                    source_root=source_root,
+                    isolated_root=isolated_root,
+                    staged=staged,
+                )
+                if metadata_error:
+                    policies.append(
+                        {
+                            "checkpoint": str(source_path),
+                            "runtime_checkpoint": str(local_path),
+                            "runtime_kind": "protected",
+                            "migrated_from_legacy": migrated,
+                            "agent": "unknown",
+                            "protocol_id": None,
+                            "runtime_selected": False,
+                            "loader_disposition": (
+                                "rejected metadata before policy loading: "
+                                f"{metadata_error}"
+                            ),
+                            "checkpoint_schema_current": False,
+                            "accepted_training_evidence": False,
+                            "safe_to_serve": True,
+                            "training_verified": False,
+                        }
+                    )
+                    continue
+                policies.append(
+                    _audit_selected_snake_bundle(
+                        dashboard_module,
+                        dashboard,
+                        local_path=local_path,
+                        source_path=source_path,
+                        metadata=metadata,
+                        episodes=episodes,
+                        migrated_from_legacy=migrated,
+                    )
+                )
+
+            # A missing protected policy is not a successful audit by vacuity.
+            # Start the real fallback path for that policy family, require the
+            # loader to select the staged production artifact, and compare its
+            # behavior with a fresh same-architecture initialization.
+            protected_selected = {
+                row.get("agent")
+                for row in policies
+                if row.get("runtime_selected") is True
+                and row.get("runtime_kind") == "protected"
+            }
+            for agent in ("mlp", "cnn"):
+                if agent not in protected_selected:
+                    policies.append(
+                        _audit_snake_runtime_fallback(
+                            dashboard_module,
+                            dashboard,
+                            source_root=source_root,
+                            isolated_root=isolated_root,
+                            agent=agent,
+                            episodes=episodes,
+                        )
+                    )
+        finally:
+            dashboard.close()
+
+        for artifact in source_artifacts:
+            matches = [
+                row for row in policies if row["checkpoint"] == artifact["checkpoint"]
+            ]
+            if matches:
+                artifact["runtime_disposition"] = matches[0]["loader_disposition"]
+            elif artifact["layout"] == "legacy_global":
+                quarantines = list(
+                    (isolated_root / "runtime").glob(
+                        "snake_policy.best.snakeai.quarantine-*.zip"
+                    )
+                )
+                artifact["runtime_disposition"] = (
+                    "quarantined by isolated production loader"
+                    if quarantines
+                    else "legacy fallback retained but not selected on this startup"
+                )
+            else:
+                relative = Path(artifact["checkpoint"]).relative_to(source_root)
+                local_path = isolated_root / relative
+                artifact["runtime_disposition"] = (
+                    "not selectable from bundle metadata"
+                    if local_path.exists()
+                    else "quarantined by isolated production loader"
+                )
+
+    selected = [row for row in policies if row.get("runtime_selected") is True]
+    agent_summary = _snake_agent_summary(policies)
+
+    startup_row = next(
+        (
+            row
+            for row in selected
+            if startup_source is not None
+            and row["checkpoint"] == str(startup_source)
+        ),
+        None,
+    )
+    primary = startup_row or (selected[0] if selected else None)
+    legacy_artifact = next(
+        (row for row in source_artifacts if row["layout"] == "legacy_global"),
+        None,
+    )
+    legacy_note = (
+        "legacy bundle was evaluated only if the production loader validated and migrated it; "
+        "otherwise the loader reported a baseline fallback"
+        if legacy_artifact
+        else "no legacy-global bundle present"
+    )
+    no_policy_note = (
+        "missing protected policy families were exercised through their production fallback loader"
+    )
+    fallback_artifacts = [
+        {
+            **row,
+            "relative": str(row["relative"]),
+            "checkpoint": str(source_root / row["relative"]),
+        }
+        for row in staged["fallback_artifacts"]
+    ]
+    both_agents_safe = all(
+        agent_summary[agent]["runtime_selected"]
+        and agent_summary[agent]["safe_to_serve"]
+        for agent in ("mlp", "cnn")
+    )
+    both_agents_verified = all(
+        agent_summary[agent]["runtime_selected"]
+        and agent_summary[agent]["training_verified"]
+        for agent in ("mlp", "cnn")
+    )
+    return {
+        "checkpoint": (
+            primary["checkpoint"] if primary else str(legacy_source)
+        ),
+        "runtime_policy": (
+            startup_row["checkpoint"]
+            if startup_row
+            else (primary["checkpoint"] if primary else "no runtime policy selected")
+        ),
+        "artifact_exists": bool(source_artifacts)
+        or any(row["source_exists"] for row in fallback_artifacts),
+        "checkpoint_schema_current": bool(primary)
+        and bool(primary["checkpoint_schema_current"]),
+        "accepted_training_evidence": bool(primary)
+        and bool(primary["accepted_training_evidence"]),
+        "audit_protocol": primary.get("audit_protocol") if primary else None,
+        "independent_comparison": (
+            primary.get("independent_comparison") if primary else None
+        ),
+        "policies": policies,
+        "agent_summary": agent_summary,
+        "artifacts": source_artifacts,
+        "fallback_artifacts": fallback_artifacts,
+        "legacy_fallback": {
+            "checkpoint": str(legacy_source),
+            "artifact_exists": legacy_artifact is not None,
+            "runtime_disposition": (
+                legacy_artifact["runtime_disposition"]
+                if legacy_artifact
+                else "absent"
+            ),
+        },
+        "safe_to_serve": both_agents_safe,
+        "training_verified": both_agents_verified,
         "note": (
-            "legacy bundle may be behaviorally useful, but it is not current protected-training evidence"
-            if not schema_current
-            else ""
+            f"{legacy_note}; {no_policy_note}"
+            if any(row.get("runtime_kind") == "fallback" for row in policies)
+            else legacy_note
         ),
     }
 
